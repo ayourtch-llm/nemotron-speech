@@ -63,9 +63,10 @@ struct Args {
     coalesce_text: bool,
     /// Idle threshold (ms) after which a held-back partial-word tail is
     /// flushed and (with --coalesce-text) the buffered utterance is shipped.
-    /// Bump this when the consumer is an LLM and you want full-sentence
-    /// utterances; keep low for snappy display. Default 600 ms.
-    #[arg(long, default_value_t = 600)]
+    /// Default 1500 ms — comfortable for natural speech pauses (mid-sentence
+    /// breaths don't fragment utterances). Lower values give snappier display
+    /// at the cost of more fragmentation.
+    #[arg(long, default_value_t = 1500)]
     idle_flush_ms: u64,
     #[arg(long, default_value_t = false)]
     cpu: bool,
