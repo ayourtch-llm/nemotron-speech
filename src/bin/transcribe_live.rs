@@ -55,12 +55,18 @@ struct Args {
     #[arg(long)]
     text_out: Option<String>,
     /// With `--text-out`, buffer chunks within a single utterance and emit
-    /// one UDP datagram per utterance (when the 600 ms idle-flush fires or
+    /// one UDP datagram per utterance (when the idle-flush fires or
     /// the stream ends). Default: false — each chunk is sent immediately
     /// as it's emitted, which is friendlier for `nc` testing but produces
     /// per-word splices on the LLM side.
     #[arg(long, default_value_t = false)]
     coalesce_text: bool,
+    /// Idle threshold (ms) after which a held-back partial-word tail is
+    /// flushed and (with --coalesce-text) the buffered utterance is shipped.
+    /// Bump this when the consumer is an LLM and you want full-sentence
+    /// utterances; keep low for snappy display. Default 600 ms.
+    #[arg(long, default_value_t = 600)]
+    idle_flush_ms: u64,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -155,8 +161,8 @@ async fn main() -> Result<()> {
     // splitting a word across two log lines.
     let mut emitted_idx: usize = 0;
     // If no new token has been produced for this long, the held-back tail
-    // must be a complete word — flush it.
-    let idle_flush = std::time::Duration::from_millis(600);
+    // must be a complete word — flush it. Configurable via --idle-flush-ms.
+    let idle_flush = std::time::Duration::from_millis(args.idle_flush_ms);
     let mut last_token_time = std::time::Instant::now();
     // With --coalesce-text, accumulate chunks within an utterance here and
     // ship the whole buffer on idle-flush / is_final.
