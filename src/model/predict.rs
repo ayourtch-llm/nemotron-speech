@@ -13,7 +13,6 @@ pub struct PredictNet {
     embed: Tensor,                  // (vocab_size + 1, pred_hidden)
     lstm: Vec<candle_nn::LSTM>,     // length = pred_rnn_layers
     pred_hidden: usize,
-    blank_idx: usize,
     device: Device,
     dtype: DType,
 }
@@ -56,7 +55,6 @@ impl PredictNet {
             embed,
             lstm: lstm_layers,
             pred_hidden: cfg.pred_hidden,
-            blank_idx: cfg.blank_idx,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })

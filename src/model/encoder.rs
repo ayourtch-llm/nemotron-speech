@@ -18,7 +18,7 @@
 use crate::model::ModelConfig;
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor, D};
-use candle_nn::{Activation, Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
+use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -125,7 +125,7 @@ impl DwStridingSubsampling {
     /// Input: mel `(B, n_mels, T)`. Output: `(B, T_out, d_model)`.
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         // Reshape (B, n_mels, T) -> (B, 1, T, n_mels)
-        let (b, m, t) = mel.dims3()?;
+        let (b, m, _t) = mel.dims3()?;
         debug_assert_eq!(m, self.n_mels);
         let x = mel.transpose(1, 2)?.unsqueeze(1)?; // (B, 1, T, n_mels)
 
@@ -276,7 +276,7 @@ impl ConvModule {
         let x = self.dw.forward(&x)?;
         // norm: applied across channel dim; LayerNorm expects last-dim. Move
         // channel last: (B, d, 1, T) -> (B, T, 1, d) -> (B, T, d)
-        let (_b2, dc, _h, tt) = x.dims4()?;
+        let (_b2, dc, _h, _tt) = x.dims4()?;
         debug_assert_eq!(dc, self.d_model);
         let xn = x.permute((0, 3, 2, 1))?.squeeze(2)?; // (B, T, d)
         let xn = self.norm.forward(&xn)?;
