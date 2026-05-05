@@ -10,9 +10,12 @@ You are picking up where the previous session left off on this project: a Rust +
 - Same output via `transcribe_streaming` (chunked encoder with KV + conv caches).
 - Same output via `transcribe_live` (AudioSource-driven; FileChunkSource, MicSource, and UdpSource all work).
 - **Mic smoke-tested live** on both CPU and Metal. Clean full-words-only output via the word-initial token detection in `transcribe_live`. CPU works great — 2+ hour continuous run during a real call, no crashes, captures speech well.
-- **UDP path live**. `transcribe_live --udp-listen <addr>` accepts datagrams of raw f32-LE 16 kHz mono PCM; companion `udp_mic_send --target host:port` captures from the mic and sends them. Validated locally with both a Python-from-WAV sender and the live mic→sender→listener loop on `127.0.0.1`.
+- **UDP path live**. `transcribe_live --udp-listen <addr>` accepts datagrams of raw f32-LE 16 kHz mono PCM; companion `udp_mic_send --target host:port` captures from the mic and sends them. Validated locally with a Python-from-WAV sender and the live mic→sender→listener loop on `127.0.0.1`, then end-to-end across machines: Mac mic → UDP → CUDA box.
+- **CUDA validated**. On a DGX Spark / GB10 (Grace ARM + Blackwell, CUDA 13.0): build with `--features cuda` succeeds (38 s cold, 4 s warm), `transcribe` produces bit-identical tokens to CPU (`[69, 15, 57, 3, ...]`). Encoder forward 694 ms, greedy decode 32 ms (~2.6× faster than CPU on the small-T workload). Encoder load ~5.5 s (one-time weight upload to GPU).
 - **Incremental front-end shipped.** `IncrementalMelExtractor` (preemph + reflection state) and a streaming subsample stack with per-stage rolling buffers replace the full-buffer recompute. Per-chunk cost is now O(chunk_size) instead of O(total_audio). Bit-exact for subsample slices ≥32 mel frames; FP32 BLAS-summation noise (~1e-6 relative) for tiny slices.
+- **Idle-flush for streaming output.** `transcribe_live` flushes the held-back partial-word tail after 600 ms with no new tokens. Removes the previous "last word stuck until you speak again" behavior without hurting word-coherent splits at chunk boundaries.
 - **Offline timing on M1 CPU (5 s clip):** mel 12.5 ms · encoder forward 1.48 s · greedy decode 136 ms. ~3.4× real-time. Pipeline timing is essentially unchanged after the incremental front-end work.
+- **One-shot model setup**: `bash tools/get_model.sh` downloads + extracts + converts + tokenizes. Idempotent. Validated on a fresh CUDA box.
 
 ## Devices: CPU works, Metal does not (for live mic)
 
@@ -65,7 +68,7 @@ In rough priority order:
 
 1. **Mic source no-drop guarantee.** `MicSource::open_default` uses `tx.try_send` which silently drops on a full channel (depth=64). Switch to `blocking_send` (or grow the channel to ~4096) so dense speech can never silently lose audio. This is the proximate cause of the Metal-mic failure mode and is worth fixing regardless of device.
 2. **Batch the incremental subsample drains.** `StreamingPipeline::drain_subsample` currently calls `forward_incremental` on every `try_advance` (often a single new mel frame). Defer until ≥32 new mel frames are available (or `finished`); this is the slice size where `subsample_check` is bit-exact and where Metal kernel-launch overhead amortizes. Likely makes Metal viable for live mic.
-3. **Longer-utterance test on the CUDA box.** User has a ~4.5-minute audio file they'll plug in. This is where the chunked-limited mask actually matters and where CUDA throughput should win over CPU.
+3. **Longer-utterance test.** A ~4.5-minute clip would exercise the chunked-limited attention mask (chunked-mask is a no-op on the 5 s clip per gotcha #8). On CUDA where Grace CPU encoder is already 536 ms/5 s of audio (3× faster than M1), the longer-T regime is where Blackwell should pull ahead of CPU even for streaming chunks.
 4. **Punctuation smoothing (low priority).** Model emits sentence-final periods at chunk boundaries even mid-thought. Cosmetic — could be improved by holding back trailing punctuation tokens too, but diminishing returns.
 5. **UDP framing improvements (low priority).** Current wire format is bare raw PCM, no header/sequence number. Fine for local LAN with one sender. For lossy or multi-source paths a 4-byte sequence + 2-byte payload-len header would help detect drops and concatenate fragmented packets. Add only when there's a real loss/reorder problem to solve.
 
@@ -120,11 +123,21 @@ In rough priority order:
 
 `transcribe_live` emits one `[chunk] <text>` line per chunk that has new content. To avoid mid-word splits at chunk boundaries (`[chunk] t` / `[chunk] erminal`), it holds back the trailing partial-word run and only emits text up to the most recent word-initial SentencePiece token. Word-initial detection is via detokenize-diff: a token is word-initial iff appending it adds a leading space to the running text. End-of-stream (`is_final`) flushes any held-back tail. See `last_word_initial()` in the binary.
 
-Trade-off: the last word of an utterance only appears once the *next* word starts (or on stream end). Acceptable for live dictation; visible in logs as a steady one-word-trailing display.
+Trade-off mostly removed by the 600 ms idle-flush: `Instant::now()` is captured each iteration, and if no new tokens have arrived since the previous one for that long, the held-back tail is emitted (the speaker has obviously paused). Resumes word-boundary holding on the next token-producing chunk.
+
+## Cross-machine workflow (CUDA box)
+
+When working with the CUDA box, two tttt ptys are typically set up:
+- `pty-2`: SSH session into the CUDA box (`ayourtch@gx10-96b6` or `192.168.0.192` on local LAN), already inside `~/rust/nemotron-speech`.
+- `pty-3`: Local Mac shell with `ssh-add`'d key for password-less `git push`.
+
+Workflow: edit locally → `git commit` → drive `pty-3` to `git push` → drive `pty-2` to `git pull && cargo build --release --features cuda --bin <whatever>` → run on the box. The repo origin is `git@github.com:ayourtch-llm/nemotron-speech.git`. Model + tokenizer get there via `bash tools/get_model.sh`; private wav files are scp'd separately.
+
+For the live cross-machine demo: listener on box (`transcribe_live --udp-listen 0.0.0.0:9999`) + sender on Mac (`udp_mic_send --target 192.168.0.192:9999`). Use the LAN address, not the Tailscale 100.x.x.x — direct LAN is much lower latency.
 
 ## Last commit
 
-`git log -1 --oneline` should show something around `udp_mic_send: cpal mic capture -> raw f32-LE 16k UDP packets` (or a follow-up state.md tweak). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
+`git log -1 --oneline` should show something around `transcribe_live: idle-flush the held-back tail after 600 ms` (or a follow-up state.md tweak). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
 
 ## Things to NOT do
 

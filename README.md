@@ -62,10 +62,12 @@ cp models/extracted/*tokenizer.model models/tokenizer.model
 |---|---|
 | `transcribe` | File → text via the offline encoder. The simplest path. |
 | `transcribe_streaming` | File → text but the encoder runs chunk-by-chunk with KV + conv caches. Same output as `transcribe`. |
-| `transcribe_live` | Audio-source-driven streaming. Works for files (default) and mic (`--features mic --mic`). UDP source slot is set up but not implemented. |
+| `transcribe_live` | Audio-source-driven streaming. Files (`--audio`), mic (`--features mic --mic`), or UDP receiver (`--udp-listen <addr>`). |
+| `udp_mic_send` | Companion sender (with `--features mic`): captures mic, sends raw f32-LE 16 kHz mono PCM to a `--target host:port`. Pairs with `transcribe_live --udp-listen`. |
 | `mel_check` | Diff Rust mel vs Python mel reference. |
 | `encoder_check` | Diff Rust encoder vs Python encoder reference, by stage (`subsample`, `layer0`, `encoder`). |
 | `streaming_check` | Diff streaming encoder output vs offline+mask reference. |
+| `subsample_check` | Diff streaming subsample vs offline `forward()` across slice sizes. |
 
 ## Build features
 
@@ -104,32 +106,33 @@ The streaming math is whatever the trained `cache_aware_rnnt.yaml` recipe specif
 ```
 src/
 ├── audio.rs           symphonia file loader -> 16 kHz mono f32
-├── audio_source.rs    AudioSource trait + FileChunkSource + MicSource (mic feature)
-├── features.rs        log-mel matching the model's preprocessor exactly
-├── streaming.rs       StreamingPipeline (push_audio + try_advance)
+├── audio_source.rs    AudioSource trait + FileChunkSource + MicSource + UdpSource
+├── features.rs        log-mel (offline + IncrementalMelExtractor with preemph state)
+├── streaming.rs       StreamingPipeline (push_audio + try_advance, fully incremental)
 ├── tokenizer.rs       SentencePiece wrapper
 ├── model/
 │   ├── mod.rs           ModelConfig
-│   ├── encoder.rs       DwStridingSubsampling, ConformerLayer, RelPosMha,
-│   │                    ConvModule, FastConformerEncoder, EncoderCache
+│   ├── encoder.rs       DwStridingSubsampling (offline + streaming with rolling
+│   │                    per-stage buffers), ConformerLayer, RelPosMha, ConvModule,
+│   │                    FastConformerEncoder, EncoderCache, SubsampleStreamingState
 │   ├── predict.rs       2-layer LSTM prediction net (candle_nn::lstm)
 │   ├── joint.rs         Split-projection joint network
 │   └── greedy.rs        Greedy RNN-T decoding (single-stream, blank-as-pad)
 └── bin/                 (see "Binaries" above)
 
 tools/
+├── get_model.sh         Idempotent: download + extract + convert + tokenizer
 ├── convert_nemo.py      One-shot .nemo -> safetensors with key remapping
 ├── reference_mel.py     PyTorch mel reference; writes a flat .bin Rust can diff against
 └── reference_encoder.py PyTorch reimpl of subsample / layer0 / full encoder using saved weights
 ```
 
-## What's deliberately not done yet
+## What's still on the list
 
-- **Incremental front-end.** `StreamingPipeline::advance_chunk` currently re-runs mel + subsample over the full accumulated audio buffer each chunk. Correct (subsample is causal) but O(N) per chunk. A streaming front-end (preemph state + reflect-pad state + per-stage 2D conv cache) is the next optimization. The encoder/decoder side is already cache-aware.
-- **Mic smoke test.** `transcribe_live --features mic --mic` compiles but isn't part of the validated path yet.
-- **UDP audio source.** Trait slot exists; implementation pending.
-- **Performance tuning.** Metal currently loses to CPU on the 5 s test clip due to kernel-launch overhead on tiny tensors. Should win on longer utterances. CUDA hasn't been profiled at all.
+- **Mic source: stop dropping samples.** `MicSource::open_default` uses `tx.try_send` which silently drops when the channel backs up. Switching to `blocking_send` or growing the depth-64 channel would prevent the live-mic-on-Metal failure mode.
+- **Batch incremental subsample drains.** Currently called on every `try_advance` (often a single new mel frame). Deferring until ≥32 frames are available is bit-exact in `subsample_check` and would reduce per-call kernel-launch overhead, especially on Metal.
+- **Longer-utterance test.** A multi-minute clip would actually exercise the chunked-limited attention mask (no-op on the 5 s clip per the assumed `att_context_size`) and let CUDA pull ahead of CPU on raw throughput.
 
 ## License
 
-The model weights are NVIDIA's, governed by their terms — see the [Hugging Face model card](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). The Rust source in this repository is © its contributors; pick a license that suits your use.
+The model weights are NVIDIA's, governed by their terms — see the [Hugging Face model card](https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b). The Rust source in this repository is licensed under [Apache-2.0](LICENSE).
