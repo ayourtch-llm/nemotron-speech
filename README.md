@@ -27,6 +27,19 @@ Each row's reference is reproducible by running the corresponding script in [`to
 You'll need the model from Hugging Face (~2.4 GB) and a Python with `torch`, `safetensors`, and `numpy` available for the one-shot weight conversion.
 
 ```sh
+# Download + extract + convert in one go (idempotent; safe to re-run).
+bash tools/get_model.sh
+
+# Then transcribe a wav file:
+cargo run --release --bin transcribe -- \
+    --audio path/to/some.wav \
+    --st  models/nemotron-speech-streaming-en-0.6b.safetensors \
+    --tok models/tokenizer.model --cpu
+```
+
+Or run the steps manually:
+
+```sh
 # 1. Download the model (gitignored under models/)
 mkdir -p models
 curl -L -o models/nemotron-speech-streaming-en-0.6b.nemo \
@@ -41,12 +54,6 @@ python3 tools/convert_nemo.py \
     --ckpt models/extracted/model_weights.ckpt \
     --out  models/nemotron-speech-streaming-en-0.6b.safetensors
 cp models/extracted/*tokenizer.model models/tokenizer.model
-
-# 4. Transcribe
-cargo run --release --bin transcribe -- \
-    --audio tmp/small-test.wav \
-    --st  models/nemotron-speech-streaming-en-0.6b.safetensors \
-    --tok models/tokenizer.model --cpu
 ```
 
 ## Binaries
