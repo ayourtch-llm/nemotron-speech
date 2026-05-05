@@ -369,6 +369,20 @@ impl IncrementalMelExtractor {
         out
     }
 
+    /// Return mel frames `[start, frames_emitted)` in `(n_mels, K)` row-major
+    /// layout. Useful for feeding only newly-arrived frames to a streaming
+    /// subsample stack.
+    pub fn mel_buffer_since(&self, start: usize) -> Vec<f32> {
+        let n_mels = self.cfg.n_mels;
+        let end = self.frames_emitted;
+        let k = end.saturating_sub(start);
+        let mut out = Vec::with_capacity(n_mels * k);
+        for m in 0..n_mels {
+            out.extend_from_slice(&self.mel_rows[m][start..end]);
+        }
+        out
+    }
+
     fn compute_available_frames(&mut self) {
         let avail = self.available_frames();
         if avail <= self.frames_emitted {

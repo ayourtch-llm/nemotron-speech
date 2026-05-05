@@ -1,15 +1,15 @@
 //! End-to-end streaming pipeline: audio samples in, transcribed token IDs out.
 //!
-//! The encoder layers run with KV + conv caches per chunk and produce
-//! bit-equivalent output to the offline path. Mel features are computed
-//! incrementally via `IncrementalMelExtractor` (preemph history +
-//! reflection state), so per-chunk mel cost is O(chunk_samples) rather
-//! than O(total_audio). The subsampling stack still re-runs on the full
-//! mel buffer each chunk; an incremental version is the next step.
+//! Both the front-end (mel + subsample) and the encoder layers run
+//! incrementally — per-chunk cost is O(chunk_size), not O(total_audio).
+//! `IncrementalMelExtractor` carries preemph + reflection state;
+//! `SubsampleStreamingState` carries 2-frame caches at each stride-2
+//! conv stage; the conformer layers carry KV + conv-module caches.
+//! Cumulative output is byte-equivalent to the offline path on `finish()`.
 
 use crate::features::{IncrementalMelExtractor, MelConfig};
 use crate::model::ModelConfig;
-use crate::model::encoder::{EncoderCache, FastConformerEncoder};
+use crate::model::encoder::{EncoderCache, FastConformerEncoder, SubsampleStreamingState};
 use crate::model::greedy::{GreedyDecoder, GreedyDecoderConfig};
 use crate::model::joint::JointNet;
 use crate::model::predict::PredictNet;
@@ -24,10 +24,12 @@ pub struct StreamingPipeline {
     pub mel_cfg: MelConfig,
     pub cfg: ModelConfig,
     device: Device,
-    #[allow(dead_code)]
     dtype: DType,
 
-    encoded_so_far: usize,        // number of encoded frames already pushed through the encoder
+    /// Number of mel frames already fed to the streaming subsample stack.
+    mel_consumed: usize,
+    sub_state: SubsampleStreamingState,
+    encoded_so_far: usize, // encoded frames already pushed through the conformer encoder
     cache: EncoderCache,
     decoder: GreedyDecoder,
     pub all_tokens: Vec<u32>,
@@ -63,6 +65,8 @@ impl StreamingPipeline {
             cfg,
             device,
             dtype,
+            mel_consumed: 0,
+            sub_state: SubsampleStreamingState::empty(),
             encoded_so_far: 0,
             cache,
             decoder,
@@ -82,30 +86,44 @@ impl StreamingPipeline {
         self.mel.finish();
     }
 
-    /// How many encoded frames are *now* available given the audio buffered
-    /// so far? Derived from the incremental mel's frame count + the subsample
-    /// stack's `floor(N/2)+1` per-stage rule (3 stages).
-    fn available_encoded_frames(&self) -> usize {
-        let n_mel = self.mel.available_frames();
-        if n_mel == 0 {
-            return 0;
+    /// Drain newly-available mel frames through the streaming subsample
+    /// stack. Idempotent: calling twice with no new mel is a no-op (unless
+    /// the stream has just been finished, in which case it flushes the
+    /// trailing tentative frames).
+    fn drain_subsample(&mut self) -> Result<()> {
+        let total_mel = self.mel.n_frames_emitted();
+        let new_mel = total_mel - self.mel_consumed;
+        let mel_finished = self.mel.is_finished();
+        let need_call =
+            new_mel > 0 || (mel_finished && !self.sub_state.is_finalized());
+        if !need_call {
+            return Ok(());
         }
-        let mut k = n_mel;
-        for _ in 0..3 {
-            k = k / 2 + 1;
-        }
-        k
+        let n_mels = self.mel_cfg.n_mels;
+        let slice = self.mel.mel_buffer_since(self.mel_consumed);
+        let new_tensor =
+            Tensor::from_vec(slice, (1, n_mels, new_mel), &self.device)?;
+        self.encoder
+            .subsample
+            .forward_incremental(
+                &new_tensor,
+                &mut self.sub_state,
+                &self.device,
+                self.dtype,
+                mel_finished,
+            )
+            .map_err(|e| anyhow::anyhow!("subsample incremental: {e:#}"))?;
+        self.mel_consumed = total_mel;
+        Ok(())
     }
 
     /// Try to process one chunk. Returns the new tokens emitted (if any).
     /// Returns Ok(None) when there isn't enough buffered audio yet.
     pub fn try_advance(&mut self) -> Result<Option<Vec<u32>>> {
+        self.drain_subsample()?;
         let chunk_size = self.cfg.chunk_size_enc_frames();
-        let avail = self.available_encoded_frames();
+        let avail = self.sub_state.n_emitted;
         let needed = self.encoded_so_far + chunk_size;
-        // We need a *full* chunk of new frames, otherwise streaming math
-        // (positional embedding lengths, KV cache size) gets uglier. On
-        // finish(), accept a smaller tail chunk.
         if avail < needed {
             if self.mel.is_finished() && avail > self.encoded_so_far {
                 return self.advance_chunk(avail - self.encoded_so_far).map(Some);
@@ -116,21 +134,12 @@ impl StreamingPipeline {
     }
 
     fn advance_chunk(&mut self, len: usize) -> Result<Vec<u32>> {
-        // Pull current mel from the incremental extractor — already in
-        // (n_mels, T) row-major. Subsample still runs on the full buffer
-        // each call (causal, so old frames are stable).
-        let log_mel = self.mel.mel_buffer();
-        let n_mel = log_mel.len() / self.mel_cfg.n_mels;
-        let mel_t = Tensor::from_vec(log_mel, (1, self.mel_cfg.n_mels, n_mel), &self.device)?;
-
-        let subsampled = self
-            .encoder
-            .subsample
-            .forward(&mel_t)
-            .map_err(|e| anyhow::anyhow!("subsample: {e:#}"))?;
-        let chunk = subsampled
-            .narrow(1, self.encoded_so_far, len)?
-            .contiguous()?;
+        let enc_buf = self
+            .sub_state
+            .output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("advance_chunk before any subsample output"))?;
+        let chunk = enc_buf.narrow(1, self.encoded_so_far, len)?.contiguous()?;
 
         let enc_out = self
             .encoder

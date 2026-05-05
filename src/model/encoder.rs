@@ -147,6 +147,202 @@ impl DwStridingSubsampling {
         let x = self.out.forward(&x)?;
         Ok(x)
     }
+
+    /// Streaming variant: feeds the next slice of mel frames through the
+    /// stack while keeping a per-stage rolling buffer of unconsumed
+    /// pre-conv input frames. Initial buffer = 2 zero frames per stage
+    /// (matching offline's `pad_causal2d` left-zero-pad of size 2).
+    ///
+    /// Output is appended to `state.output`. Only "stable" frames whose
+    /// right-context is real are emitted mid-stream. When `finished ==
+    /// true`, a right-zero-pad of 1 is applied at each stage so the
+    /// cumulative output exactly matches `forward()` on the same total
+    /// mel input.
+    pub fn forward_incremental(
+        &self,
+        new_mel: &Tensor, // (1, n_mels, T_new)
+        state: &mut SubsampleStreamingState,
+        device: &Device,
+        dtype: DType,
+        finished: bool,
+    ) -> Result<()> {
+        if state.finalized {
+            return Ok(());
+        }
+        let (b, m, _t_new) = new_mel.dims3()?;
+        debug_assert_eq!(m, self.n_mels);
+        let mut x = new_mel.transpose(1, 2)?.unsqueeze(1)?; // (1, 1, T_new, n_mels)
+
+        // Stage 0 — input channel = 1, freq dim = n_mels
+        if state.stage0_buf.is_none() {
+            state.stage0_buf = Some(Tensor::zeros((b, 1, 2, self.n_mels), dtype, device)?);
+        }
+        x = self.stage_run(
+            x,
+            state.stage0_buf.as_mut().unwrap(),
+            &self.conv0,
+            None,
+            true,
+            finished,
+        )?;
+
+        // Stage 1
+        let c = x.dim(1)?;
+        let f = x.dim(3)?;
+        if state.stage1_buf.is_none() {
+            state.stage1_buf = Some(Tensor::zeros((b, c, 2, f), dtype, device)?);
+        }
+        x = self.stage_run(
+            x,
+            state.stage1_buf.as_mut().unwrap(),
+            &self.dw1,
+            Some(&self.pw1),
+            true,
+            finished,
+        )?;
+
+        // Stage 2
+        let c = x.dim(1)?;
+        let f = x.dim(3)?;
+        if state.stage2_buf.is_none() {
+            state.stage2_buf = Some(Tensor::zeros((b, c, 2, f), dtype, device)?);
+        }
+        x = self.stage_run(
+            x,
+            state.stage2_buf.as_mut().unwrap(),
+            &self.dw2,
+            Some(&self.pw2),
+            true,
+            finished,
+        )?;
+
+        // (B, C, T_new_2, F') -> (B, T_new_2, C*F') -> linear
+        let (_b, c2, tp, f2) = x.dims4()?;
+        if tp == 0 {
+            state.finalized |= finished;
+            return Ok(());
+        }
+        let new_enc = x.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, tp, c2 * f2))?;
+        let new_enc = self.out.forward(&new_enc)?; // (1, T_new_2, d_model)
+
+        let new_emit = new_enc.dim(1)?;
+        state.n_emitted += new_emit;
+        state.output = match state.output.take() {
+            Some(prev) => Some(Tensor::cat(&[prev, new_enc], 1)?),
+            None => Some(new_enc),
+        };
+        state.finalized |= finished;
+        Ok(())
+    }
+
+    /// Run one subsample stage incrementally on a rolling buffer.
+    ///
+    /// `buf` is the unconsumed tail of this stage's input sequence (along
+    /// the time axis), pre-freq-pad. Initially it holds 2 zero frames (=
+    /// offline's left-pad-2). On entry we append `x` to it, optionally
+    /// append a single zero on the right when `finished`, run the conv
+    /// (stride 2, k=3) — which produces `(t_buf - 3)/2 + 1` stable output
+    /// frames — and drop `2 * n_emitted` input positions from the front
+    /// of `buf` so the next call's first read aligns with where the conv
+    /// left off.
+    fn stage_run(
+        &self,
+        x: Tensor,                    // (B, C_in, T_new, F_in)
+        buf: &mut Tensor,             // (B, C_in, T_buf, F_in)
+        dw_or_conv0: &Conv2d,
+        pw: Option<&Conv2d>,
+        relu_after: bool,
+        finished: bool,
+    ) -> Result<Tensor> {
+        // 1) Append new frames.
+        let extended = Tensor::cat(&[&*buf, &x], 2)?;
+
+        // 2) Optionally append right-pad-1 (only when finished).
+        let to_conv = if finished {
+            extended.pad_with_zeros(D::Minus2, 0, 1)?
+        } else {
+            extended.clone()
+        };
+        let t_conv = to_conv.dim(2)?;
+
+        // 3) Number of stable output frames.
+        let n_emit = if t_conv >= 3 { (t_conv - 3) / 2 + 1 } else { 0 };
+        if n_emit == 0 {
+            // Update buf to include the new frames; nothing emitted this call.
+            *buf = extended;
+            // Empty stage output: shape (B, C_out, 0, F_out). Build a zero
+            // tensor of the right shape via the existing freq-padded shape,
+            // run conv on a 3-frame slice. But there's none — return the
+            // properly-shaped zero. Since the caller must accept any T_new,
+            // and downstream stages will short-circuit at tp==0 too, return
+            // the simplest tensor with T=0.
+            // Easiest: construct via narrow-with-len-0 from a forward call
+            // on a minimum-length input — but that's surgery. Cheat by
+            // running conv on `to_conv` if t_conv >= 3, otherwise produce
+            // shape via a zero-frame output. We branch on n_emit, so
+            // t_conv < 3 here. Build a (B, C_in, 0, F_freq_pad) zero and
+            // forward the conv to discover output shape.
+            let device = to_conv.device();
+            let dtype = to_conv.dtype();
+            let f_in_padded = to_conv.dim(3)? + 3;
+            let probe = Tensor::zeros(
+                (to_conv.dim(0)?, to_conv.dim(1)?, 3, f_in_padded),
+                dtype,
+                device,
+            )?;
+            let probe_out = dw_or_conv0.forward(&probe)?;
+            let probe_out = if let Some(pw) = pw { pw.forward(&probe_out)? } else { probe_out };
+            let f_out = probe_out.dim(3)?;
+            let c_out = probe_out.dim(1)?;
+            return Ok(Tensor::zeros((to_conv.dim(0)?, c_out, 0, f_out), dtype, device)?);
+        }
+
+        // 4) Update buf for next call (skip if finished — no further calls).
+        if !finished {
+            let t_ext = extended.dim(2)?;
+            let drop = 2 * n_emit;
+            let keep = t_ext - drop;
+            *buf = extended.narrow(2, drop, keep)?.contiguous()?;
+        }
+
+        // 5) Convolve.
+        let to_conv = to_conv.pad_with_zeros(D::Minus1, 2, 1)?;
+        let mut y = dw_or_conv0.forward(&to_conv)?;
+        if let Some(pw) = pw {
+            y = pw.forward(&y)?;
+        }
+        if relu_after {
+            y = y.relu()?;
+        }
+        Ok(y)
+    }
+}
+
+/// Rolling per-stage input buffers + accumulating output for the streaming subsample.
+pub struct SubsampleStreamingState {
+    stage0_buf: Option<Tensor>,
+    stage1_buf: Option<Tensor>,
+    stage2_buf: Option<Tensor>,
+    pub output: Option<Tensor>, // (1, T_total_emitted, d_model)
+    pub n_emitted: usize,
+    finalized: bool,
+}
+
+impl SubsampleStreamingState {
+    pub fn empty() -> Self {
+        Self {
+            stage0_buf: None,
+            stage1_buf: None,
+            stage2_buf: None,
+            output: None,
+            n_emitted: 0,
+            finalized: false,
+        }
+    }
+
+    pub fn is_finalized(&self) -> bool {
+        self.finalized
+    }
 }
 
 // ---------------------------------------------------------------------------
