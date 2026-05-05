@@ -56,15 +56,15 @@ fn main() -> Result<()> {
     let device = if args.cpu {
         Device::Cpu
     } else {
-        // Try Metal, fall back to CPU. CUDA path engages with the `cuda` feature.
+        // Pick the GPU enabled by features; fall back to CPU on failure or
+        // when neither GPU feature is enabled. Metal and CUDA are assumed
+        // mutually exclusive (macOS vs Linux).
         #[cfg(feature = "metal")]
-        {
-            Device::new_metal(0).unwrap_or(Device::Cpu)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            Device::Cpu
-        }
+        { Device::new_metal(0).unwrap_or(Device::Cpu) }
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        { Device::new_cuda(0).unwrap_or(Device::Cpu) }
+        #[cfg(not(any(feature = "metal", feature = "cuda")))]
+        { Device::Cpu }
     };
     let dtype = DType::F32;
     println!("device: {:?}, dtype: {:?}", device, dtype);

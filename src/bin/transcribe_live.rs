@@ -67,13 +67,11 @@ async fn main() -> Result<()> {
         Device::Cpu
     } else {
         #[cfg(feature = "metal")]
-        {
-            Device::new_metal(0).unwrap_or(Device::Cpu)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            Device::Cpu
-        }
+        { Device::new_metal(0).unwrap_or(Device::Cpu) }
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        { Device::new_cuda(0).unwrap_or(Device::Cpu) }
+        #[cfg(not(any(feature = "metal", feature = "cuda")))]
+        { Device::Cpu }
     };
     let dtype = DType::F32;
     eprintln!("device: {:?}", device);
