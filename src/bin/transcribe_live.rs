@@ -113,36 +113,66 @@ async fn main() -> Result<()> {
     eprintln!("listening... (Ctrl-C to stop)");
     std::io::stderr().flush().ok();
 
+    // Index up to which we've already emitted text. We hold back any trailing
+    // partial-word run so the next chunk's pieces can complete it without
+    // splitting a word across two log lines.
+    let mut emitted_idx: usize = 0;
+
     loop {
         match source.next_chunk().await? {
             None => break,
             Some(chunk) => {
+                let is_final = chunk.is_final;
                 pipe.push_audio(&chunk.samples);
-                if chunk.is_final {
+                if is_final {
                     pipe.finish();
                 }
-                let mut chunk_text = String::new();
-                while let Some(new_tokens) = pipe.try_advance()? {
-                    if !new_tokens.is_empty() {
-                        let total = &pipe.all_tokens;
-                        let prev_len = total.len() - new_tokens.len();
-                        let prev_text = if prev_len == 0 {
-                            String::new()
-                        } else {
-                            tok.detokenize(&total[..prev_len])?
-                        };
-                        let cur_text = tok.detokenize(total)?;
-                        let new_text = cur_text.strip_prefix(&prev_text).unwrap_or(&cur_text);
-                        chunk_text.push_str(new_text);
-                    }
-                }
-                if !chunk_text.is_empty() {
-                    eprintln!("[chunk] {}", chunk_text);
+                while let Some(_) = pipe.try_advance()? {}
+
+                let n = pipe.all_tokens.len();
+                let upto = if is_final {
+                    n
+                } else {
+                    last_word_initial(&tok, &pipe.all_tokens, emitted_idx, n)?
+                        .unwrap_or(emitted_idx)
+                };
+                if upto > emitted_idx {
+                    let prev = if emitted_idx == 0 {
+                        String::new()
+                    } else {
+                        tok.detokenize(&pipe.all_tokens[..emitted_idx])?
+                    };
+                    let cur = tok.detokenize(&pipe.all_tokens[..upto])?;
+                    let new_text = cur.strip_prefix(&prev).unwrap_or(&cur);
+                    eprintln!("[chunk] {}", new_text);
                     std::io::stderr().flush().ok();
+                    emitted_idx = upto;
                 }
             }
         }
     }
     eprintln!();
     Ok(())
+}
+
+/// Find the highest index k in `[lo, hi)` such that `tokens[k]` starts a new
+/// word (its decoded piece introduces a leading space, or k == 0). Returns
+/// None if no such index exists in the range.
+fn last_word_initial(
+    tok: &Tokenizer,
+    tokens: &[u32],
+    lo: usize,
+    hi: usize,
+) -> Result<Option<usize>> {
+    for k in (lo..hi).rev() {
+        if k == 0 {
+            return Ok(Some(0));
+        }
+        let before = tok.detokenize(&tokens[..k])?;
+        let after = tok.detokenize(&tokens[..k + 1])?;
+        if after.len() > before.len() && after.as_bytes()[before.len()] == b' ' {
+            return Ok(Some(k));
+        }
+    }
+    Ok(None)
 }
