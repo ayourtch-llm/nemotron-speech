@@ -8,8 +8,9 @@ You are picking up where the previous session left off on this project: a Rust +
 
 - File → text via `cargo run --release --bin transcribe -- --audio tmp/small-test.wav --st models/nemotron-speech-streaming-en-0.6b.safetensors --tok models/tokenizer.model --cpu` → "This is a small test to see how the recognition works."
 - Same output via `transcribe_streaming` (chunked encoder with KV + conv caches).
-- Same output via `transcribe_live` (AudioSource-driven; FileChunkSource works).
+- Same output via `transcribe_live` (AudioSource-driven; FileChunkSource, MicSource, and UdpSource all work).
 - **Mic smoke-tested live** on both CPU and Metal. Clean full-words-only output via the word-initial token detection in `transcribe_live`. CPU works great — 2+ hour continuous run during a real call, no crashes, captures speech well.
+- **UDP path live**. `transcribe_live --udp-listen <addr>` accepts datagrams of raw f32-LE 16 kHz mono PCM; companion `udp_mic_send --target host:port` captures from the mic and sends them. Validated locally with both a Python-from-WAV sender and the live mic→sender→listener loop on `127.0.0.1`.
 - **Incremental front-end shipped.** `IncrementalMelExtractor` (preemph + reflection state) and a streaming subsample stack with per-stage rolling buffers replace the full-buffer recompute. Per-chunk cost is now O(chunk_size) instead of O(total_audio). Bit-exact for subsample slices ≥32 mel frames; FP32 BLAS-summation noise (~1e-6 relative) for tiny slices.
 - **Offline timing on M1 CPU (5 s clip):** mel 12.5 ms · encoder forward 1.48 s · greedy decode 136 ms. ~3.4× real-time. Pipeline timing is essentially unchanged after the incremental front-end work.
 
@@ -65,8 +66,8 @@ In rough priority order:
 1. **Mic source no-drop guarantee.** `MicSource::open_default` uses `tx.try_send` which silently drops on a full channel (depth=64). Switch to `blocking_send` (or grow the channel to ~4096) so dense speech can never silently lose audio. This is the proximate cause of the Metal-mic failure mode and is worth fixing regardless of device.
 2. **Batch the incremental subsample drains.** `StreamingPipeline::drain_subsample` currently calls `forward_incremental` on every `try_advance` (often a single new mel frame). Defer until ≥32 new mel frames are available (or `finished`); this is the slice size where `subsample_check` is bit-exact and where Metal kernel-launch overhead amortizes. Likely makes Metal viable for live mic.
 3. **Longer-utterance test on the CUDA box.** User has a ~4.5-minute audio file they'll plug in. This is where the chunked-limited mask actually matters and where CUDA throughput should win over CPU.
-4. **UDP audio source.** User mentioned future use case: real-time UDP packet ingestion. The `AudioSource` trait abstraction is set up exactly for this. UDP receiver thread → mpsc → `MicSource`-style consumer.
-5. **Punctuation smoothing (low priority).** Model emits sentence-final periods at chunk boundaries even mid-thought. Cosmetic — could be improved by holding back trailing punctuation tokens too, but diminishing returns.
+4. **Punctuation smoothing (low priority).** Model emits sentence-final periods at chunk boundaries even mid-thought. Cosmetic — could be improved by holding back trailing punctuation tokens too, but diminishing returns.
+5. **UDP framing improvements (low priority).** Current wire format is bare raw PCM, no header/sequence number. Fine for local LAN with one sender. For lossy or multi-source paths a 4-byte sequence + 2-byte payload-len header would help detect drops and concatenate fragmented packets. Add only when there's a real loss/reorder problem to solve.
 
 ## User context (from this session)
 
@@ -110,7 +111,9 @@ In rough priority order:
 │       ├── streaming_check.rs  Streaming-encoder diff vs offline+mask
 │       ├── transcribe.rs       Original offline file -> text
 │       ├── transcribe_streaming.rs  Same but encoder runs chunked with caches
-│       └── transcribe_live.rs       AudioSource-driven (file or mic)
+│       ├── transcribe_live.rs       AudioSource-driven (file / mic / udp-listen)
+│       ├── udp_mic_send.rs     mic -> raw f32-LE 16k UDP packets (companion sender)
+│       └── subsample_check.rs  Streaming-subsample diff vs offline forward()
 ```
 
 ## Streaming output formatting (transcribe_live)
@@ -121,7 +124,7 @@ Trade-off: the last word of an utterance only appears once the *next* word start
 
 ## Last commit
 
-`git log -1 --oneline` should show `Incremental subsample stack (rolling per-stage buffers)` (or similar — there'll be one more state.md update after that). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
+`git log -1 --oneline` should show something around `udp_mic_send: cpal mic capture -> raw f32-LE 16k UDP packets` (or a follow-up state.md tweak). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
 
 ## Things to NOT do
 
