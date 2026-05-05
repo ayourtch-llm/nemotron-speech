@@ -54,6 +54,13 @@ struct Args {
     /// consumer that wants to splice user words into its KV cache.
     #[arg(long)]
     text_out: Option<String>,
+    /// With `--text-out`, buffer chunks within a single utterance and emit
+    /// one UDP datagram per utterance (when the 600 ms idle-flush fires or
+    /// the stream ends). Default: false — each chunk is sent immediately
+    /// as it's emitted, which is friendlier for `nc` testing but produces
+    /// per-word splices on the LLM side.
+    #[arg(long, default_value_t = false)]
+    coalesce_text: bool,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -151,6 +158,9 @@ async fn main() -> Result<()> {
     // must be a complete word — flush it.
     let idle_flush = std::time::Duration::from_millis(600);
     let mut last_token_time = std::time::Instant::now();
+    // With --coalesce-text, accumulate chunks within an utterance here and
+    // ship the whole buffer on idle-flush / is_final.
+    let mut utterance_buf: String = String::new();
 
     loop {
         match source.next_chunk().await? {
@@ -176,6 +186,7 @@ async fn main() -> Result<()> {
                     last_word_initial(&tok, &pipe.all_tokens, emitted_idx, n)?
                         .unwrap_or(emitted_idx)
                 };
+                let mut new_chunk_text = String::new();
                 if upto > emitted_idx {
                     let prev = if emitted_idx == 0 {
                         String::new()
@@ -186,17 +197,36 @@ async fn main() -> Result<()> {
                     let new_text = cur.strip_prefix(&prev).unwrap_or(&cur);
                     eprintln!("[chunk] {}", new_text);
                     std::io::stderr().flush().ok();
-                    if let Some((sock, target)) = &text_sink {
-                        // Best-effort: drop on send error rather than killing
-                        // the transcription path. UDP send_to is non-blocking
-                        // for typical kernel buffers.
-                        let mut payload = Vec::with_capacity(new_text.len() + 1);
-                        payload.extend_from_slice(new_text.as_bytes());
+                    new_chunk_text = new_text.to_string();
+                }
+
+                if let Some((sock, target)) = &text_sink {
+                    if args.coalesce_text {
+                        // Accumulate; ship the whole utterance on idle/final.
+                        utterance_buf.push_str(&new_chunk_text);
+                        let utterance_done = (idle_long_enough || is_final)
+                            && !utterance_buf.is_empty();
+                        if utterance_done {
+                            let mut payload = Vec::with_capacity(utterance_buf.len() + 1);
+                            payload.extend_from_slice(utterance_buf.as_bytes());
+                            payload.push(b'\n');
+                            if let Err(e) = sock.send_to(&payload, target) {
+                                tracing::debug!("text-out send: {e}");
+                            }
+                            utterance_buf.clear();
+                        }
+                    } else if !new_chunk_text.is_empty() {
+                        // Default: send each chunk's new text immediately.
+                        let mut payload = Vec::with_capacity(new_chunk_text.len() + 1);
+                        payload.extend_from_slice(new_chunk_text.as_bytes());
                         payload.push(b'\n');
                         if let Err(e) = sock.send_to(&payload, target) {
                             tracing::debug!("text-out send: {e}");
                         }
                     }
+                }
+
+                if upto > emitted_idx {
                     emitted_idx = upto;
                 }
             }
