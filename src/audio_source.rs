@@ -63,6 +63,81 @@ impl AudioSource for FileChunkSource {
     }
 }
 
+/// UDP source: receives raw PCM `f32` little-endian samples (16 kHz mono)
+/// over UDP, accumulates them, and yields fixed-size audio chunks. Each
+/// datagram's bytes are interpreted as a contiguous slice of f32 samples
+/// and appended to an internal buffer; chunks are emitted whenever the
+/// buffer reaches `chunk_samples`.
+///
+/// Wire format: a datagram of `4 * N` bytes carries `N` f32 samples in
+/// little-endian order. Datagrams whose length isn't a multiple of 4 are
+/// dropped with a warning (likely a sender bug).
+///
+/// Loss/reorder: UDP gives no guarantees, but for a local LAN with a
+/// single sender both are essentially zero. We don't sequence-number for
+/// now — packet loss would manifest as audio gaps which the encoder
+/// handles gracefully (state.md gotcha #9: subsample is causal in time,
+/// old encoded frames stay stable).
+pub struct UdpSource {
+    socket: tokio::net::UdpSocket,
+    chunk_samples: usize,
+    buffer: Vec<f32>,
+    recv_buf: Vec<u8>,
+}
+
+impl UdpSource {
+    pub async fn bind(addr: &str, chunk_samples: usize) -> Result<Self> {
+        assert!(chunk_samples > 0);
+        let socket = tokio::net::UdpSocket::bind(addr).await?;
+        Ok(Self {
+            socket,
+            chunk_samples,
+            buffer: Vec::with_capacity(chunk_samples * 4),
+            // 65_536 covers any UDP datagram (max IPv4 payload).
+            recv_buf: vec![0u8; 65_536],
+        })
+    }
+
+    /// The bound address, useful when binding to port 0.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(self.socket.local_addr()?)
+    }
+}
+
+#[async_trait]
+impl AudioSource for UdpSource {
+    fn sample_rate(&self) -> u32 {
+        16_000
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<AudioChunk>> {
+        while self.buffer.len() < self.chunk_samples {
+            let (n, _peer) = self.socket.recv_from(&mut self.recv_buf).await?;
+            if n % 4 != 0 {
+                tracing::warn!(
+                    "ignoring UDP datagram of {n} bytes (not a multiple of 4 — expected raw f32 LE)"
+                );
+                continue;
+            }
+            let n_samples = n / 4;
+            self.buffer.reserve(n_samples);
+            for i in 0..n_samples {
+                let off = i * 4;
+                let bytes = [
+                    self.recv_buf[off],
+                    self.recv_buf[off + 1],
+                    self.recv_buf[off + 2],
+                    self.recv_buf[off + 3],
+                ];
+                self.buffer.push(f32::from_le_bytes(bytes));
+            }
+        }
+        let chunk: Vec<f32> = self.buffer.drain(..self.chunk_samples).collect();
+        // UDP streams are open-ended — the caller stops when they want.
+        Ok(Some(AudioChunk { samples: chunk, is_final: false }))
+    }
+}
+
 /// Microphone source via cpal. Available with the `mic` feature.
 ///
 /// cpal's `Stream` is `!Send` because most audio backends require their

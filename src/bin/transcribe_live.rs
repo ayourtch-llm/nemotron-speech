@@ -21,7 +21,7 @@ use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
 use nemotron_speech::audio::load_audio_mono_16k;
-use nemotron_speech::audio_source::{AudioSource, FileChunkSource};
+use nemotron_speech::audio_source::{AudioSource, FileChunkSource, UdpSource};
 #[cfg(feature = "mic")]
 use nemotron_speech::audio_source::mic::MicSource;
 use nemotron_speech::features::{IncrementalMelExtractor, MelConfig};
@@ -40,11 +40,15 @@ struct Args {
     st: PathBuf,
     #[arg(long)]
     tok: PathBuf,
-    #[arg(long, conflicts_with = "mic")]
+    #[arg(long, conflicts_with_all = ["mic", "udp_listen"])]
     audio: Option<PathBuf>,
     /// Read from the default microphone (requires `--features mic`).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "udp_listen")]
     mic: bool,
+    /// Bind a UDP socket and treat each datagram as raw f32-LE 16 kHz mono PCM.
+    /// Example: `--udp-listen 0.0.0.0:9999`.
+    #[arg(long)]
+    udp_listen: Option<String>,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -93,21 +97,26 @@ async fn main() -> Result<()> {
         encoder, predict, joint, mel, mel_cfg, cfg, device, dtype,
     )?;
 
-    let mut source: Box<dyn AudioSource> = match (&args.audio, args.mic) {
-        (Some(p), false) => {
-            let samples = load_audio_mono_16k(p)?;
-            // Feed in 320-sample (~20 ms) chunks to exercise the streaming
-            // advance logic; the pipeline batches up internally.
-            Box::new(FileChunkSource::new(samples, 320))
-        }
+    let mut source: Box<dyn AudioSource> = if let Some(p) = &args.audio {
+        let samples = load_audio_mono_16k(p)?;
+        // Feed in 320-sample (~20 ms) chunks to exercise the streaming
+        // advance logic; the pipeline batches up internally.
+        Box::new(FileChunkSource::new(samples, 320))
+    } else if let Some(addr) = &args.udp_listen {
+        let src = UdpSource::bind(addr, 320).await?;
+        eprintln!("UDP listening on {}", src.local_addr()?);
+        Box::new(src)
+    } else if args.mic {
         #[cfg(feature = "mic")]
-        (None, true) => Box::new(MicSource::open_default(320)?),
+        {
+            Box::new(MicSource::open_default(320)?)
+        }
         #[cfg(not(feature = "mic"))]
-        (None, true) => {
+        {
             anyhow::bail!("rebuild with --features mic to use microphone input");
         }
-        (None, false) => anyhow::bail!("specify --audio <file> or --mic"),
-        (Some(_), true) => unreachable!(),
+    } else {
+        anyhow::bail!("specify --audio <file>, --mic, or --udp-listen <addr>");
     };
 
     eprintln!("listening... (Ctrl-C to stop)");
