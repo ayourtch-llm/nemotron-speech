@@ -65,7 +65,9 @@ RENAME_RULES: list[tuple[re.Pattern, str]] = [
 
     # rnn-t prediction net
     (re.compile(r"^decoder\.prediction\.embed\.weight$"), r"predict.embed.weight"),
-    (re.compile(r"^decoder\.prediction\.dec_rnn\.lstm\.(weight|bias)_(ih|hh)_l(\d+)$"), r"predict.lstm.l\3.\1_\2"),
+    # Keep PyTorch's `_l<idx>` suffix so candle_nn::lstm() with prefix
+    # `predict.lstm` finds `weight_ih_l0`, `weight_hh_l0`, etc.
+    (re.compile(r"^decoder\.prediction\.dec_rnn\.lstm\.(weight|bias)_(ih|hh)_l(\d+)$"), r"predict.lstm.\1_\2_l\3"),
 
     # rnn-t joint
     (re.compile(r"^joint\.enc\.(weight|bias)$"), r"joint.enc.\1"),

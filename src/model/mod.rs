@@ -5,6 +5,9 @@
 //! safetensors keys produced by `tools/convert_nemo.py`.
 
 pub mod encoder;
+pub mod greedy;
+pub mod joint;
+pub mod predict;
 
 use candle_core::{DType, Device};
 
