@@ -49,6 +49,11 @@ struct Args {
     /// Example: `--udp-listen 0.0.0.0:9999`.
     #[arg(long)]
     udp_listen: Option<String>,
+    /// Mirror each emitted chunk as plain text (newline-terminated) to a UDP
+    /// target. Pairs with `nc -lu <port>` for testing or with an LLM-side
+    /// consumer that wants to splice user words into its KV cache.
+    #[arg(long)]
+    text_out: Option<String>,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -117,6 +122,24 @@ async fn main() -> Result<()> {
         anyhow::bail!("specify --audio <file>, --mic, or --udp-listen <addr>");
     };
 
+    // Optional text-mirroring sink: a UDP socket bound to an ephemeral port
+    // that forwards each emitted chunk (plain text + '\n') to a target.
+    let text_sink: Option<(std::net::UdpSocket, std::net::SocketAddr)> = match &args.text_out {
+        None => None,
+        Some(spec) => {
+            use std::net::ToSocketAddrs;
+            let target = spec
+                .to_socket_addrs()
+                .with_context(|| format!("resolving --text-out target {spec}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no addresses for {spec}"))?;
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0")
+                .context("binding ephemeral UDP socket for --text-out")?;
+            eprintln!("text-out: sending to {target}");
+            Some((sock, target))
+        }
+    };
+
     eprintln!("listening... (Ctrl-C to stop)");
     std::io::stderr().flush().ok();
 
@@ -163,6 +186,17 @@ async fn main() -> Result<()> {
                     let new_text = cur.strip_prefix(&prev).unwrap_or(&cur);
                     eprintln!("[chunk] {}", new_text);
                     std::io::stderr().flush().ok();
+                    if let Some((sock, target)) = &text_sink {
+                        // Best-effort: drop on send error rather than killing
+                        // the transcription path. UDP send_to is non-blocking
+                        // for typical kernel buffers.
+                        let mut payload = Vec::with_capacity(new_text.len() + 1);
+                        payload.extend_from_slice(new_text.as_bytes());
+                        payload.push(b'\n');
+                        if let Err(e) = sock.send_to(&payload, target) {
+                            tracing::debug!("text-out send: {e}");
+                        }
+                    }
                     emitted_idx = upto;
                 }
             }
