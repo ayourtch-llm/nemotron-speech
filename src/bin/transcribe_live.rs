@@ -124,6 +124,10 @@ async fn main() -> Result<()> {
     // partial-word run so the next chunk's pieces can complete it without
     // splitting a word across two log lines.
     let mut emitted_idx: usize = 0;
+    // If no new token has been produced for this long, the held-back tail
+    // must be a complete word — flush it.
+    let idle_flush = std::time::Duration::from_millis(600);
+    let mut last_token_time = std::time::Instant::now();
 
     loop {
         match source.next_chunk().await? {
@@ -134,10 +138,16 @@ async fn main() -> Result<()> {
                 if is_final {
                     pipe.finish();
                 }
+                let prev_total = pipe.all_tokens.len();
                 while let Some(_) = pipe.try_advance()? {}
-
                 let n = pipe.all_tokens.len();
-                let upto = if is_final {
+                let now = std::time::Instant::now();
+                if n > prev_total {
+                    last_token_time = now;
+                }
+
+                let idle_long_enough = now.duration_since(last_token_time) >= idle_flush;
+                let upto = if is_final || idle_long_enough {
                     n
                 } else {
                     last_word_initial(&tok, &pipe.all_tokens, emitted_idx, n)?
