@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         (Some(_), true) => unreachable!(),
     };
 
-    eprint!("text: ");
+    eprintln!("listening... (Ctrl-C to stop)");
     std::io::stderr().flush().ok();
 
     loop {
@@ -121,9 +121,9 @@ async fn main() -> Result<()> {
                 if chunk.is_final {
                     pipe.finish();
                 }
+                let mut chunk_text = String::new();
                 while let Some(new_tokens) = pipe.try_advance()? {
                     if !new_tokens.is_empty() {
-                        // Compute the diff text between previous prefix and current.
                         let total = &pipe.all_tokens;
                         let prev_len = total.len() - new_tokens.len();
                         let prev_text = if prev_len == 0 {
@@ -133,9 +133,12 @@ async fn main() -> Result<()> {
                         };
                         let cur_text = tok.detokenize(total)?;
                         let new_text = cur_text.strip_prefix(&prev_text).unwrap_or(&cur_text);
-                        eprint!("{}", new_text);
-                        std::io::stderr().flush().ok();
+                        chunk_text.push_str(new_text);
                     }
+                }
+                if !chunk_text.is_empty() {
+                    eprintln!("[chunk] {}", chunk_text);
+                    std::io::stderr().flush().ok();
                 }
             }
         }
