@@ -291,10 +291,44 @@ impl ConvModule {
 }
 
 // ---------------------------------------------------------------------------
+// Chunked-limited attention mask (additive form: 0 for visible, very
+// negative for masked).
+// ---------------------------------------------------------------------------
+
+/// Build an additive `(T, T)` attention mask shaped to broadcast over
+/// `(B, h, T, T)` scores. `chunk_size = att_context_size[1] + 1`,
+/// `left_chunks = att_context_size[0] / chunk_size`.
+///
+/// `mask[i][j] = 0`  if frame j is visible from frame i
+/// `mask[i][j] = -1e9` otherwise
+///
+/// Visibility rule (chunk-aligned):  c_j ∈ [c_i - left_chunks, c_i].
+pub fn chunked_limited_mask(
+    t: usize,
+    chunk_size: usize,
+    left_chunks: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut data = vec![0.0f32; t * t];
+    let neg_inf = -1e9f32;
+    for i in 0..t {
+        let c_i = i / chunk_size;
+        for j in 0..t {
+            let c_j = j / chunk_size;
+            let visible = c_j <= c_i && c_i - c_j <= left_chunks;
+            if !visible {
+                data[i * t + j] = neg_inf;
+            }
+        }
+    }
+    let m = Tensor::from_vec(data, (1, 1, t, t), device)?.to_dtype(dtype)?;
+    Ok(m)
+}
+
+// ---------------------------------------------------------------------------
 // Multi-Head Attention with relative positional embeddings (Transformer-XL)
 // ---------------------------------------------------------------------------
-// We start with full-attention (no mask) to validate algebra. Cache + chunked
-// masking come in a later commit.
 
 pub struct RelPosMha {
     q: Linear,
@@ -336,7 +370,13 @@ impl RelPosMha {
     }
 
     /// `x`: `(B, T, d_model)`; `pos_emb`: `(1, 2T-1, d_model)` sinusoidal.
-    pub fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    /// `attn_bias`: optional additive mask, broadcastable to `(B, h, T, T)`.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        attn_bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, t, _d) = x.dims3()?;
         let h = self.n_heads;
         let dh = self.d_head;
@@ -394,6 +434,10 @@ impl RelPosMha {
 
         let scale = 1.0 / (dh as f64).sqrt();
         let scores = (matrix_ac + matrix_bd)?.affine(scale, 0.0)?;
+        let scores = match attn_bias {
+            Some(bias) => scores.broadcast_add(bias)?,
+            None => scores,
+        };
 
         let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = attn.matmul(&v)?; // (B, h, T, dh)
@@ -458,7 +502,12 @@ impl ConformerLayer {
         })
     }
 
-    pub fn forward(&self, x: &Tensor, pos_emb: &Tensor) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        attn_bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         // FF1 macaron half
         let r = x.clone();
         let y = self.norm_ff1.forward(x)?;
@@ -468,7 +517,7 @@ impl ConformerLayer {
         // Self-attention
         let r = x.clone();
         let y = self.norm_attn.forward(&x)?;
-        let y = self.attn.forward(&y, pos_emb)?;
+        let y = self.attn.forward(&y, pos_emb, attn_bias)?;
         let x = (r + y)?;
 
         // Conv
@@ -538,14 +587,33 @@ impl FastConformerEncoder {
         Ok(Self { subsample, layers, cfg })
     }
 
-    /// Offline forward. `mel`: `(B, n_mels, T)`. Returns `(B, T_out, d_model)`.
+    /// Offline forward with full attention. `mel`: `(B, n_mels, T)`.
     pub fn forward_offline(&self, mel: &Tensor) -> Result<Tensor> {
+        self.forward_full(mel, /* with_chunked_mask = */ false)
+    }
+
+    /// Offline forward over the whole utterance, optionally applying the
+    /// trained chunked-limited attention mask. Functionally identical to the
+    /// streaming pass when caches are unbounded; used as the validation
+    /// reference for the chunk-by-chunk path.
+    pub fn forward_full(&self, mel: &Tensor, with_chunked_mask: bool) -> Result<Tensor> {
         let x = self.subsample.forward(mel)?;
         let (_b, t_out, _d) = x.dims3()?;
         let pos = rel_position_emb(t_out, self.cfg.d_model, x.device(), x.dtype())?;
+        let mask = if with_chunked_mask {
+            Some(chunked_limited_mask(
+                t_out,
+                self.cfg.chunk_size_enc_frames(),
+                self.cfg.left_chunks(),
+                x.device(),
+                x.dtype(),
+            )?)
+        } else {
+            None
+        };
         let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &pos)?;
+            x = layer.forward(&x, &pos, mask.as_ref())?;
         }
         Ok(x)
     }

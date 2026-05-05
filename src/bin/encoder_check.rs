@@ -189,7 +189,7 @@ fn main() -> Result<()> {
                 // bisection is enabled by partial-stage references generated
                 // by the reference script.
                 if args.stage == "layer0" {
-                    let out = layer.forward(&enc, &pos).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    let out = layer.forward(&enc, &pos, None).map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     compare(&out, &ref_shape, &ref_data, args.atol)?;
                 } else {
                     bail!(

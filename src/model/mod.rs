@@ -28,6 +28,11 @@ pub struct ModelConfig {
     pub joint_hidden: usize,
     pub pred_rnn_layers: usize,
     pub pos_emb_max_len: usize,
+    /// Default chunked-limited attention context: [left_frames, right_frames]
+    /// in encoded (post-subsampling, 80 ms) frames. The supported set for
+    /// the published checkpoint is [70, 0|1|6|13]; we default to [70, 13]
+    /// (best WER, ~1.12 s lookahead).
+    pub att_context_size: [usize; 2],
 }
 
 impl ModelConfig {
@@ -48,7 +53,16 @@ impl ModelConfig {
             joint_hidden: 640,
             pred_rnn_layers: 2,
             pos_emb_max_len: 5000,
+            att_context_size: [70, 13],
         }
+    }
+
+    pub fn chunk_size_enc_frames(&self) -> usize {
+        self.att_context_size[1] + 1
+    }
+
+    pub fn left_chunks(&self) -> usize {
+        self.att_context_size[0] / self.chunk_size_enc_frames()
     }
 }
 

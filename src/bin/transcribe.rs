@@ -36,6 +36,12 @@ struct Args {
     /// Force CPU even if Metal/CUDA features are enabled.
     #[arg(long, default_value_t = false)]
     cpu: bool,
+    /// Apply the chunked-limited attention mask the model was trained with.
+    /// For utterances shorter than (left_chunks+1) * chunk_size encoder
+    /// frames, this is a no-op and output should be byte-identical to the
+    /// full-attention path.
+    #[arg(long, default_value_t = false)]
+    chunked_mask: bool,
 }
 
 fn main() -> Result<()> {
@@ -107,7 +113,7 @@ fn main() -> Result<()> {
     println!("encoder forward...");
     let t0 = std::time::Instant::now();
     let enc_out = encoder
-        .forward_offline(&mel_t)
+        .forward_full(&mel_t, args.chunked_mask)
         .map_err(|e| anyhow::anyhow!("encoder forward: {e:#}"))?;
     println!("encoder forward took {:?}; output shape {:?}", t0.elapsed(), enc_out.dims());
 
