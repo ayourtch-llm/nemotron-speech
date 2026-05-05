@@ -8,7 +8,9 @@ You are picking up where the previous session left off on this project: a Rust +
 
 - File → text via `cargo run --release --bin transcribe -- --audio tmp/small-test.wav --st models/nemotron-speech-streaming-en-0.6b.safetensors --tok models/tokenizer.model --cpu` → "This is a small test to see how the recognition works."
 - Same output via `transcribe_streaming` (chunked encoder with KV + conv caches).
-- Same output via `transcribe_live` (AudioSource-driven; FileChunkSource works, MicSource compiles).
+- Same output via `transcribe_live` (AudioSource-driven; FileChunkSource works).
+- **Mic smoke-tested live** on both CPU and Metal. Clean full-words-only output via the word-initial token detection in `transcribe_live`. Latency feels ~1–2 s per chunk on M1; Metal not noticeably faster than CPU on this workload (small tensors, kernel-launch overhead dominates as previous-me predicted).
+- **Offline timing on M1 CPU (5 s clip):** mel 12.5 ms · encoder forward 1.48 s · greedy decode 136 ms. ~3.4× real-time, with ~3× headroom for streaming chunks (~330 ms compute / 1.12 s budget).
 
 ## Numerical receipts (don't redo these unless something changes)
 
@@ -49,10 +51,10 @@ In rough priority order:
 1. **Incremental front-end.** Today `StreamingPipeline::advance_chunk` re-runs mel + subsample on the full accumulated audio buffer each chunk. Correct (causal) but O(N) per chunk where N grows with utterance length. Proper streaming wants:
    - `MelExtractor` with state: 1 sample of preemph history, last `n_fft/2` samples for reflection padding (note: right-side reflection at the end of a stream needs *future* samples, so output lags by `n_fft/(2*hop) = 1` mel frame).
    - `DwStridingSubsampling` with per-stage conv state caches: `(k−1)` input frames at each of 3 stages. After 3 strides of 2 with the asymmetric `(2, 1)` pad, the audio-side context needed is small (~8 mel frames ≈ 80 ms).
-2. **Live mic smoke test.** `transcribe_live --features mic --mic` compiles but has never been spoken into. Worth running while the user is around.
-3. **Longer-utterance test on the CUDA box.** User has a ~4.5 (minutes? something) audio file they'll plug in tomorrow. This is where the chunked-limited mask actually matters and where Metal/CUDA throughput should win over CPU.
-4. **UDP audio source.** User mentioned future use case: real-time UDP packet ingestion. The `AudioSource` trait abstraction is set up exactly for this. UDP receiver thread → mpsc → `MicSource`-style consumer.
-5. **Performance.** Metal is currently *slower* than CPU on the 5 s clip due to per-op kernel launch overhead on small tensors (T=64). Should win on longer audio or batching. Haven't profiled CUDA at all.
+2. **Longer-utterance test on the CUDA box.** User has a ~4.5 (minutes? something) audio file they'll plug in tomorrow. This is where the chunked-limited mask actually matters and where Metal/CUDA throughput should win over CPU.
+3. **UDP audio source.** User mentioned future use case: real-time UDP packet ingestion. The `AudioSource` trait abstraction is set up exactly for this. UDP receiver thread → mpsc → `MicSource`-style consumer.
+4. **Performance.** Metal is currently *slower* than CPU on the 5 s clip due to per-op kernel launch overhead on small tensors (T=64). Should win on longer audio or batching. Haven't profiled CUDA at all.
+5. **Punctuation smoothing (low priority).** Model emits sentence-final periods at chunk boundaries even mid-thought. Cosmetic — could be improved by holding back trailing punctuation tokens too, but diminishing returns.
 
 ## User context (from this session)
 
@@ -99,9 +101,15 @@ In rough priority order:
 │       └── transcribe_live.rs       AudioSource-driven (file or mic)
 ```
 
+## Streaming output formatting (transcribe_live)
+
+`transcribe_live` emits one `[chunk] <text>` line per chunk that has new content. To avoid mid-word splits at chunk boundaries (`[chunk] t` / `[chunk] erminal`), it holds back the trailing partial-word run and only emits text up to the most recent word-initial SentencePiece token. Word-initial detection is via detokenize-diff: a token is word-initial iff appending it adds a leading space to the running text. End-of-stream (`is_final`) flushes any held-back tail. See `last_word_initial()` in the binary.
+
+Trade-off: the last word of an utterance only appears once the *next* word starts (or on stream end). Acceptable for live dictation; visible in logs as a steady one-word-trailing display.
+
 ## Last commit
 
-`git log -1 --oneline` should show `transcribe_live: streaming binary driven by AudioSource trait` (or similar). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
+`git log -1 --oneline` should show `transcribe_live: hold back partial words at chunk boundaries` (or similar). The tree should be clean. If it's not, look at `git status` first — the user might have started something.
 
 ## Things to NOT do
 
