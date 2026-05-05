@@ -24,7 +24,7 @@ use nemotron_speech::audio::load_audio_mono_16k;
 use nemotron_speech::audio_source::{AudioSource, FileChunkSource};
 #[cfg(feature = "mic")]
 use nemotron_speech::audio_source::mic::MicSource;
-use nemotron_speech::features::{MelConfig, MelExtractor};
+use nemotron_speech::features::{IncrementalMelExtractor, MelConfig};
 use nemotron_speech::model::ModelConfig;
 use nemotron_speech::model::encoder::FastConformerEncoder;
 use nemotron_speech::model::joint::JointNet;
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     eprintln!("device: {:?}", device);
 
     let mel_cfg = MelConfig::nemotron_default();
-    let mel = MelExtractor::from_safetensors(&args.st, mel_cfg.clone())?;
+    let mel = IncrementalMelExtractor::from_safetensors(&args.st, mel_cfg.clone())?;
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&[args.st.clone()], dtype, &device)
             .context("loading safetensors")?

@@ -197,6 +197,253 @@ impl MelExtractor {
     }
 }
 
+/// Stateful streaming variant of `MelExtractor`.
+///
+/// Audio is pushed in arbitrary chunks; emittable mel frames become available
+/// as enough samples are buffered to compute them WITHOUT right-side
+/// reflection. Calling `finish()` then unlocks the final 1–2 frames using
+/// right-side reflection (matching the offline torch.stft `center=True` tail).
+///
+/// Pre-emphasis is run incrementally with a one-sample history. The internal
+/// pre-emphasized sample buffer is pruned as frames advance — only the
+/// minimum needed for the next frame's window is retained.
+///
+/// Output layout (`mel_buffer`) is `(n_mels, T)` row-major, matching the
+/// offline `forward()` so a `StreamingPipeline` can drop it into a tensor
+/// without transposing.
+pub struct IncrementalMelExtractor {
+    cfg: MelConfig,
+    window: Vec<f32>,
+    mel_fb: Vec<f32>,
+    fft: Arc<dyn RealToComplex<f32>>,
+    in_buf: Vec<f32>,
+    out_buf: Vec<Complex<f32>>,
+
+    /// Pre-emphasized samples, with `pre[0]` corresponding to original-stream
+    /// index `pre_offset`. Older samples are pruned once no future frame needs
+    /// them.
+    pre: Vec<f32>,
+    pre_offset: usize,
+    /// Last raw sample seen, for preemphasis continuation across pushes.
+    last_raw: Option<f32>,
+    /// Total raw samples ever pushed (across all calls).
+    raw_count: usize,
+    /// Number of mel frames already produced and stored in `mel_rows`.
+    frames_emitted: usize,
+    finished: bool,
+
+    /// One Vec per mel bin, each of length `frames_emitted`. Storing per-row
+    /// makes appending a frame an `n_mels`-element push, and flattening to
+    /// `(n_mels, T)` row-major is a sequence of `extend_from_slice` calls.
+    mel_rows: Vec<Vec<f32>>,
+}
+
+impl IncrementalMelExtractor {
+    pub fn new(cfg: MelConfig, window: Vec<f32>, mel_fb: Vec<f32>) -> Result<Self> {
+        if window.len() != cfg.win_length {
+            return Err(anyhow!(
+                "window length mismatch: got {}, expected {}",
+                window.len(),
+                cfg.win_length
+            ));
+        }
+        let n_bins = cfg.n_fft / 2 + 1;
+        if mel_fb.len() != cfg.n_mels * n_bins {
+            return Err(anyhow!(
+                "mel_fb size mismatch: got {}, expected {}*{} = {}",
+                mel_fb.len(),
+                cfg.n_mels,
+                n_bins,
+                cfg.n_mels * n_bins
+            ));
+        }
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(cfg.n_fft);
+        let mel_rows = vec![Vec::new(); cfg.n_mels];
+        Ok(Self {
+            in_buf: vec![0.0f32; cfg.n_fft],
+            out_buf: vec![Complex::<f32>::new(0.0, 0.0); n_bins],
+            cfg,
+            window,
+            mel_fb,
+            fft,
+            pre: Vec::new(),
+            pre_offset: 0,
+            last_raw: None,
+            raw_count: 0,
+            frames_emitted: 0,
+            finished: false,
+            mel_rows,
+        })
+    }
+
+    pub fn from_safetensors<P: AsRef<Path>>(path: P, cfg: MelConfig) -> Result<Self> {
+        use safetensors::SafeTensors;
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("reading {}", path.as_ref().display()))?;
+        let st = SafeTensors::deserialize(&bytes).context("safetensors parse")?;
+        let window = read_f32_tensor(&st, "preproc.window")?;
+        let mel_fb_raw = read_f32_tensor(&st, "preproc.mel_fb")?;
+        Self::new(cfg, window, mel_fb_raw)
+    }
+
+    pub fn config(&self) -> &MelConfig {
+        &self.cfg
+    }
+
+    pub fn n_frames_emitted(&self) -> usize {
+        self.frames_emitted
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Append more raw audio. Pre-emphasis runs incrementally using
+    /// `last_raw` for continuity; the very first sample of the entire stream
+    /// follows the offline convention `pre[0] = audio[0]`.
+    pub fn push_audio(&mut self, samples: &[f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let p = self.cfg.preemph;
+        let mut last = self.last_raw;
+        if p == 0.0 {
+            self.pre.extend_from_slice(samples);
+        } else {
+            for &s in samples {
+                let pre = match last {
+                    Some(prev) => s - p * prev,
+                    None => s,
+                };
+                self.pre.push(pre);
+                last = Some(s);
+            }
+        }
+        self.last_raw = if p == 0.0 {
+            samples.last().copied().or(self.last_raw)
+        } else {
+            last
+        };
+        self.raw_count += samples.len();
+        self.compute_available_frames();
+    }
+
+    /// Mark the input stream as ended — unlocks the trailing frames that need
+    /// right-side reflection.
+    pub fn finish(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.compute_available_frames();
+        }
+    }
+
+    /// Number of mel frames computable now. Matches the offline `n_frames()`
+    /// once `finish()` has been called.
+    pub fn available_frames(&self) -> usize {
+        let hop = self.cfg.hop_length;
+        let win = self.cfg.win_length;
+        let half_win = win / 2;
+        if self.finished {
+            if self.raw_count == 0 {
+                0
+            } else {
+                self.raw_count / hop + 1
+            }
+        } else if self.raw_count >= half_win {
+            (self.raw_count - half_win) / hop + 1
+        } else {
+            0
+        }
+    }
+
+    /// Read the cumulative mel buffer in `(n_mels, T)` row-major layout.
+    /// Caller can build a Tensor with shape `(1, n_mels, T)` directly.
+    pub fn mel_buffer(&self) -> Vec<f32> {
+        let n_mels = self.cfg.n_mels;
+        let t = self.frames_emitted;
+        let mut out = Vec::with_capacity(n_mels * t);
+        for m in 0..n_mels {
+            out.extend_from_slice(&self.mel_rows[m]);
+        }
+        out
+    }
+
+    fn compute_available_frames(&mut self) {
+        let avail = self.available_frames();
+        if avail <= self.frames_emitted {
+            return;
+        }
+        let n_mels = self.cfg.n_mels;
+        let n_bins = self.cfg.n_fft / 2 + 1;
+        let hop = self.cfg.hop_length;
+        let win = self.cfg.win_length;
+        let n_fft = self.cfg.n_fft;
+        let win_offset = (n_fft - win) / 2;
+        let half_win = win / 2;
+        let log_eps = self.cfg.log_zero_guard;
+
+        for t in self.frames_emitted..avail {
+            let start = t * hop;
+            for s in self.in_buf.iter_mut() {
+                *s = 0.0;
+            }
+            for i in 0..win {
+                let orig_idx = (start as isize) - (half_win as isize) + (i as isize);
+                let val = self.fetch(orig_idx);
+                self.in_buf[win_offset + i] = val * self.window[i];
+            }
+            self.fft
+                .process(&mut self.in_buf, &mut self.out_buf)
+                .expect("fft");
+            for m in 0..n_mels {
+                let row = &self.mel_fb[m * n_bins..(m + 1) * n_bins];
+                let mut acc = 0.0f32;
+                for b in 0..n_bins {
+                    let c = self.out_buf[b];
+                    let p = c.re * c.re + c.im * c.im;
+                    acc += p * row[b];
+                }
+                self.mel_rows[m].push((acc + log_eps).ln());
+            }
+        }
+
+        self.frames_emitted = avail;
+
+        // Prune: the next frame to compute is `frames_emitted`, which needs
+        // original-index `frames_emitted*hop - half_win` and onward. Drop pre
+        // samples below that.
+        let next_needed = (self.frames_emitted as isize) * (hop as isize) - (half_win as isize);
+        if next_needed > self.pre_offset as isize {
+            let drop = (next_needed as usize) - self.pre_offset;
+            let drop = drop.min(self.pre.len());
+            self.pre.drain(0..drop);
+            self.pre_offset += drop;
+        }
+    }
+
+    /// Fetch pre-emphasized sample at original-stream index `k`, applying
+    /// torch-style symmetric reflection (excluding the boundary sample) when
+    /// `k` is outside `[0, raw_count)`.
+    fn fetch(&self, k: isize) -> f32 {
+        let n = self.raw_count as isize;
+        let k = if k < 0 {
+            -k
+        } else if k >= n {
+            // Right-reflection only valid once finished; in streaming mode we
+            // shouldn't be asked for samples beyond the end.
+            debug_assert!(self.finished, "right-reflect fetch in streaming mode");
+            2 * n - 2 - k
+        } else {
+            k
+        };
+        let k = k.clamp(0, (n - 1).max(0));
+        let off = k as usize;
+        debug_assert!(off >= self.pre_offset, "pruned sample fetch");
+        self.pre[off - self.pre_offset]
+    }
+}
+
 fn reflect_pad(x: &[f32], pad: usize) -> Vec<f32> {
     if x.is_empty() {
         return Vec::new();
@@ -251,5 +498,101 @@ mod tests {
         // numpy reflect pad: pad=2, [1,2,3,4,5] -> [3,2,1,2,3,4,5,4,3]
         let p = reflect_pad(&[1.0, 2.0, 3.0, 4.0, 5.0], 2);
         assert_eq!(p, vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0]);
+    }
+
+    /// Build a deterministic Hann-like window and a tiny synthetic mel
+    /// filterbank for tests. Real precision matters: we want bit-equivalence
+    /// across offline vs incremental on the same input, so use the SAME
+    /// window/filterbank for both.
+    fn synthetic_pieces() -> (MelConfig, Vec<f32>, Vec<f32>) {
+        let cfg = MelConfig::nemotron_default();
+        let n_bins = cfg.n_fft / 2 + 1;
+        // Hann window of length win_length
+        let win: Vec<f32> = (0..cfg.win_length)
+            .map(|i| {
+                let x = (i as f32) / ((cfg.win_length - 1) as f32);
+                0.5 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()
+            })
+            .collect();
+        // A simple smooth filterbank: gaussian bumps per mel bin.
+        let mut mel_fb = vec![0.0f32; cfg.n_mels * n_bins];
+        for m in 0..cfg.n_mels {
+            let center = (m as f32) * (n_bins as f32) / (cfg.n_mels as f32);
+            let width = 4.0;
+            for b in 0..n_bins {
+                let z = ((b as f32) - center) / width;
+                mel_fb[m * n_bins + b] = (-0.5 * z * z).exp();
+            }
+        }
+        (cfg, win, mel_fb)
+    }
+
+    fn synthetic_audio(n_samples: usize) -> Vec<f32> {
+        // Mix of two sinusoids — enough spectral content to exercise the mel.
+        (0..n_samples)
+            .map(|i| {
+                let t = (i as f32) / 16_000.0;
+                0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 1320.0 * t).sin()
+            })
+            .collect()
+    }
+
+    /// Compare two `(n_mels, T)` row-major buffers; return (max_abs, mean_abs).
+    fn diff_stats(a: &[f32], b: &[f32]) -> (f32, f32) {
+        assert_eq!(a.len(), b.len(), "shape mismatch");
+        let mut max = 0.0f32;
+        let mut sum = 0.0f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let d = (x - y).abs();
+            if d > max {
+                max = d;
+            }
+            sum += d as f64;
+        }
+        (max, (sum / (a.len() as f64)) as f32)
+    }
+
+    #[test]
+    fn incremental_matches_offline_after_finish() {
+        let (cfg, win, mel_fb) = synthetic_pieces();
+        let audio = synthetic_audio(16_000); // 1 second
+        let mut offline = MelExtractor::new(cfg.clone(), win.clone(), mel_fb.clone()).unwrap();
+        let off = offline.forward(&audio);
+
+        // Stream the audio in 320-sample (20 ms) chunks.
+        let mut inc = IncrementalMelExtractor::new(cfg.clone(), win, mel_fb).unwrap();
+        for chunk in audio.chunks(320) {
+            inc.push_audio(chunk);
+        }
+        inc.finish();
+        let inc_out = inc.mel_buffer();
+
+        assert_eq!(inc.n_frames_emitted() * cfg.n_mels, inc_out.len());
+        assert_eq!(off.len(), inc_out.len(), "frame count differs");
+        let (max, mean) = diff_stats(&off, &inc_out);
+        // Same arithmetic operations, same order, identical floats expected
+        // up to FFT scratch reuse. Allow a very tight bound.
+        assert!(max < 1e-5, "max abs diff too large: {max} (mean {mean})");
+    }
+
+    #[test]
+    fn incremental_streaming_lags_offline_by_one_frame_min() {
+        // Mid-stream (no `finish()`) the incremental output should lack
+        // exactly the frames that depend on right-side reflection — at
+        // n_fft/(2*hop) ≈ 1.6 trailing frames.
+        let (cfg, win, mel_fb) = synthetic_pieces();
+        let audio = synthetic_audio(8_000);
+        let mut offline = MelExtractor::new(cfg.clone(), win.clone(), mel_fb.clone()).unwrap();
+        let off = offline.forward(&audio);
+        let off_t = off.len() / cfg.n_mels;
+
+        let mut inc = IncrementalMelExtractor::new(cfg, win, mel_fb).unwrap();
+        for chunk in audio.chunks(160) {
+            inc.push_audio(chunk);
+        }
+        let inc_t = inc.n_frames_emitted();
+        let lag = off_t - inc_t;
+        assert!(lag == 1 || lag == 2, "expected 1–2 frame lag, got {lag} (off={off_t} inc={inc_t})");
     }
 }
