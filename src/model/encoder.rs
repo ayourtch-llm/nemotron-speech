@@ -260,7 +260,28 @@ impl ConvModule {
     /// Output: `(B, T, d_model)`.
     /// `conv_context_size = causal` -> left=k-1, right=0 padding on time.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (_b, _t, d) = x.dims3()?;
+        let (out, _) = self.forward_with_cache(x, None)?;
+        Ok(out)
+    }
+
+    pub fn kernel(&self) -> usize {
+        self.kernel
+    }
+    pub fn d_model(&self) -> usize {
+        self.d_model
+    }
+
+    /// Cache-aware forward. `cache_in` is the post-GLU activations from the
+    /// last `kernel-1` time steps of the previous chunk (`(B, d, kernel-1)`).
+    /// Returns the layer output and the next cache (sized `kernel-1`).
+    /// When `cache_in` is `None`, behaves exactly like the offline path
+    /// (zero-pads the left edge by `kernel-1`).
+    pub fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        cache_in: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b, t, d) = x.dims3()?;
         debug_assert_eq!(d, self.d_model);
         // (B, T, d) -> (B, d, 1, T)
         let x = x.transpose(1, 2)?.unsqueeze(2)?;
@@ -269,11 +290,39 @@ impl ConvModule {
         // GLU along channel dim: split (a, b) on channel, gated = a * sigmoid(b)
         let half = self.d_model;
         let a = x.narrow(1, 0, half)?;
-        let b = x.narrow(1, half, half)?;
-        let x = a.broadcast_mul(&candle_nn::ops::sigmoid(&b)?)?;
-        // depthwise causal conv: pad left=(k-1), right=0 on time
-        let x = x.pad_with_zeros(D::Minus1, self.kernel - 1, 0)?;
-        let x = self.dw.forward(&x)?;
+        let bg = x.narrow(1, half, half)?;
+        let glu = a.broadcast_mul(&candle_nn::ops::sigmoid(&bg)?)?; // (B, d, 1, T)
+
+        // depthwise input: prepend cache (or zero pad) on time
+        let glu_2d = glu.squeeze(2)?; // (B, d, T)
+        let next_cache = {
+            // The next conv cache is the last (kernel-1) frames of the post-GLU
+            // activations for THIS chunk, padded with the existing cache on
+            // the left if the chunk is shorter than (kernel-1).
+            let need = self.kernel - 1;
+            if t >= need {
+                glu_2d.narrow(D::Minus1, t - need, need)?.contiguous()?
+            } else {
+                // Concatenate (cache_in_or_zeros[t..]) with glu_2d.
+                let cache_existing = match cache_in {
+                    Some(c) => c.clone(),
+                    None => Tensor::zeros((b, d, need), x.dtype(), x.device())?,
+                };
+                Tensor::cat(&[
+                    &cache_existing.narrow(D::Minus1, t, need - t)?,
+                    &glu_2d,
+                ], D::Minus1)?.contiguous()?
+            }
+        };
+
+        let prefix = match cache_in {
+            Some(c) => c.clone(),
+            None => Tensor::zeros((b, d, self.kernel - 1), x.dtype(), x.device())?,
+        };
+        let padded = Tensor::cat(&[&prefix, &glu_2d], D::Minus1)?.contiguous()?; // (B, d, k-1 + T)
+        // back to 4D for Conv2d
+        let padded4 = padded.unsqueeze(2)?;
+        let x = self.dw.forward(&padded4)?;
         // norm: applied across channel dim; LayerNorm expects last-dim. Move
         // channel last: (B, d, 1, T) -> (B, T, 1, d) -> (B, T, d)
         let (_b2, dc, _h, _tt) = x.dims4()?;
@@ -286,7 +335,7 @@ impl ConvModule {
         // pointwise2 -> (B, d, 1, T) -> (B, T, d)
         let xn = self.pw2.forward(&xn)?;
         let xn = xn.squeeze(2)?.transpose(1, 2)?; // (B, T, d)
-        Ok(xn)
+        Ok((xn, next_cache))
     }
 }
 
@@ -430,7 +479,7 @@ impl RelPosMha {
         // matrix_bd = q_v @ p^T -> shape (B, h, T, 2T-1), then rel_shift to (B, h, T, T)
         let p_kt = p.transpose(D::Minus2, D::Minus1)?.contiguous()?; // (1, h, dh, 2T-1)
         let matrix_bd_raw = q_v.broadcast_matmul(&p_kt)?; // (B, h, T, 2T-1)
-        let matrix_bd = rel_shift(&matrix_bd_raw, t)?; // (B, h, T, T)
+        let matrix_bd = rel_shift(&matrix_bd_raw, t, t)?; // (B, h, T, T)
 
         let scale = 1.0 / (dh as f64).sqrt();
         let scores = (matrix_ac + matrix_bd)?.affine(scale, 0.0)?;
@@ -448,24 +497,108 @@ impl RelPosMha {
         let out = self.out.forward(&ctx)?;
         Ok(out)
     }
+
+    /// Cache-aware forward.
+    ///
+    /// `x` is the current chunk `(B, T_q, d_model)`.
+    /// `kv_cache_in` is the previous K/V context, shape `(B, T_cache, d_model)`,
+    /// or `None` for the first chunk. The returned `kv_full` is `(cache, x)`
+    /// concatenated; the caller is responsible for trimming it to its policy
+    /// (e.g. keep last `att_context_size[0]` frames).
+    ///
+    /// `pos_emb` must be sized for `klen = T_cache + T_q` total positions
+    /// (i.e. shape `(1, 2*klen - 1, d_model)`).
+    pub fn forward_chunked(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        kv_cache_in: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (b, t_q, _d) = x.dims3()?;
+        let h = self.n_heads;
+        let dh = self.d_head;
+
+        let kv_in = match kv_cache_in {
+            Some(c) => Tensor::cat(&[c, x], 1)?.contiguous()?,
+            None => x.clone(),
+        };
+        let t_kv = kv_in.dims3()?.1;
+
+        let q = self
+            .q
+            .forward(x)?
+            .reshape((b, t_q, h, dh))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self
+            .k
+            .forward(&kv_in)?
+            .reshape((b, t_kv, h, dh))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = self
+            .v
+            .forward(&kv_in)?
+            .reshape((b, t_kv, h, dh))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let pos_len = pos_emb.dims3()?.1;
+        debug_assert_eq!(pos_len, 2 * t_kv - 1);
+        let p = self
+            .pos
+            .forward(pos_emb)?
+            .reshape((1, pos_len, h, dh))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let bias_u = self
+            .pos_bias_u
+            .reshape((1, h, 1, dh))?
+            .to_dtype(x.dtype())?;
+        let bias_v = self
+            .pos_bias_v
+            .reshape((1, h, 1, dh))?
+            .to_dtype(x.dtype())?;
+        let q_u = q.broadcast_add(&bias_u)?;
+        let q_v = q.broadcast_add(&bias_v)?;
+
+        // ac: (B, h, T_q, T_kv)
+        let matrix_ac = q_u.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)?;
+        // bd_raw: (B, h, T_q, 2*T_kv - 1) -> rel_shift -> (B, h, T_q, T_kv)
+        let p_kt = p.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+        let matrix_bd_raw = q_v.broadcast_matmul(&p_kt)?;
+        let matrix_bd = rel_shift(&matrix_bd_raw, t_q, t_kv)?;
+
+        let scale = 1.0 / (dh as f64).sqrt();
+        let scores = (matrix_ac + matrix_bd)?.affine(scale, 0.0)?;
+        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = attn.matmul(&v)?;
+        let ctx = ctx
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, t_q, h * dh))?;
+        let out = self.out.forward(&ctx)?;
+        Ok((out, kv_in))
+    }
 }
 
-/// Transformer-XL relative shift. Input `(B, h, T, 2T-1)` -> `(B, h, T, T)`.
-fn rel_shift(x: &Tensor, t: usize) -> Result<Tensor> {
-    let (b, h, t1, l) = x.dims4()?;
-    debug_assert_eq!(t1, t);
-    debug_assert_eq!(l, 2 * t - 1);
-    // Pad a column of zeros at the front of the last dim: (B, h, T, 2T)
-    let zero = Tensor::zeros((b, h, t, 1), x.dtype(), x.device())?;
-    let x = Tensor::cat(&[&zero, x], D::Minus1)?; // (B, h, T, 2T)
-    // Reshape to (B, h, 2T, T)
-    let x = x.reshape((b, h, 2 * t, t))?;
-    // Drop first row along the new T-major dim, keep last 2T-1 rows: (B, h, 2T-1, T)
-    let x = x.narrow(D::Minus2, 1, 2 * t - 1)?;
-    // Reshape back to (B, h, T, 2T-1)
-    let x = x.reshape((b, h, t, 2 * t - 1))?;
-    // Take left half + diagonal: keep first T columns -> (B, h, T, T)
-    let x = x.narrow(D::Minus1, 0, t)?;
+/// Transformer-XL relative shift, generalized to arbitrary `qlen <= klen`.
+/// Input shape: `(B, h, qlen, 2*klen-1)`. Output: `(B, h, qlen, klen)`.
+///
+/// The square case (qlen == klen) is what the offline path uses; the
+/// non-square case (qlen < klen) is what cache-aware streaming uses, where
+/// `klen = qlen + cache_len`.
+fn rel_shift(x: &Tensor, qlen: usize, klen: usize) -> Result<Tensor> {
+    let (b, h, q1, l) = x.dims4()?;
+    debug_assert_eq!(q1, qlen);
+    debug_assert_eq!(l, 2 * klen - 1);
+    let zero = Tensor::zeros((b, h, qlen, 1), x.dtype(), x.device())?;
+    let x = Tensor::cat(&[&zero, x], D::Minus1)?; // (B, h, qlen, 2*klen)
+    let x = x.contiguous()?.reshape((b, h, 2 * klen, qlen))?;
+    let x = x.narrow(D::Minus2, 1, 2 * klen - 1)?; // (B, h, 2*klen-1, qlen)
+    let x = x.contiguous()?.reshape((b, h, qlen, 2 * klen - 1))?;
+    let x = x.narrow(D::Minus1, 0, klen)?;
     Ok(x.contiguous()?)
 }
 
@@ -536,6 +669,71 @@ impl ConformerLayer {
         let x = self.norm_out.forward(&x)?;
         Ok(x)
     }
+
+    /// Cache-aware forward. `cache` is read AND written: kv updated to the
+    /// concatenation of `(old_kv, x)` (caller trims), conv updated to the
+    /// last (kernel-1) frames of post-GLU activations.
+    pub fn forward_chunked(
+        &self,
+        x: &Tensor,
+        pos_emb: &Tensor,
+        cache: &mut LayerCache,
+    ) -> Result<Tensor> {
+        // FF1 macaron half
+        let r = x.clone();
+        let y = self.norm_ff1.forward(x)?;
+        let y = self.ff1.forward(&y)?.affine(0.5, 0.0)?;
+        let x = (r + y)?;
+
+        // Self-attention with KV cache
+        let r = x.clone();
+        let y = self.norm_attn.forward(&x)?;
+        let (y, kv_full) = self.attn.forward_chunked(&y, pos_emb, cache.kv.as_ref())?;
+        cache.kv = Some(kv_full);
+        let x = (r + y)?;
+
+        // Conv with state cache
+        let r = x.clone();
+        let y = self.norm_conv.forward(&x)?;
+        let (y, conv_next) = self.conv.forward_with_cache(&y, cache.conv.as_ref())?;
+        cache.conv = Some(conv_next);
+        let x = (r + y)?;
+
+        // FF2 macaron half
+        let r = x.clone();
+        let y = self.norm_ff2.forward(&x)?;
+        let y = self.ff2.forward(&y)?.affine(0.5, 0.0)?;
+        let x = (r + y)?;
+
+        // Final LN
+        let x = self.norm_out.forward(&x)?;
+        Ok(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer streaming cache.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+pub struct LayerCache {
+    /// (B, T_kv, d_model). `None` at start; grows up to `max_kv` then slides.
+    pub kv: Option<Tensor>,
+    /// (B, d_model, kernel-1). Post-pw1+GLU activations from previous chunk.
+    pub conv: Option<Tensor>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EncoderCache {
+    pub layers: Vec<LayerCache>,
+}
+
+impl EncoderCache {
+    pub fn empty(n_layers: usize) -> Self {
+        Self {
+            layers: (0..n_layers).map(|_| LayerCache::default()).collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +794,45 @@ impl FastConformerEncoder {
     /// trained chunked-limited attention mask. Functionally identical to the
     /// streaming pass when caches are unbounded; used as the validation
     /// reference for the chunk-by-chunk path.
+    /// Run the encoder layers on a chunk of pre-subsampled features.
+    /// `encoded_chunk`: `(B, T_chunk, d_model)`.
+    /// `cache`: per-layer caches; updated in place.
+    /// Returns: encoder output for this chunk `(B, T_chunk, d_model)`.
+    pub fn forward_layers_chunked(
+        &self,
+        encoded_chunk: &Tensor,
+        cache: &mut EncoderCache,
+    ) -> Result<Tensor> {
+        let (_b, t_q, _d) = encoded_chunk.dims3()?;
+        // klen for this chunk is current cache length (from layer 0; all layers
+        // share kv cache length) plus this chunk's length.
+        let cache_len = cache
+            .layers
+            .first()
+            .and_then(|l| l.kv.as_ref())
+            .map(|t| t.dims3().map(|(_, n, _)| n).unwrap_or(0))
+            .unwrap_or(0);
+        let klen = cache_len + t_q;
+        let pos = rel_position_emb(klen, self.cfg.d_model, encoded_chunk.device(), encoded_chunk.dtype())?;
+
+        let max_kv = self.cfg.att_context_size[0];
+        let mut x = encoded_chunk.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            x = layer.forward_chunked(&x, &pos, &mut cache.layers[i])?;
+            // Trim KV cache: keep last `max_kv` frames.
+            if let Some(kv) = cache.layers[i].kv.take() {
+                let (_, n, _) = kv.dims3()?;
+                let trimmed = if n > max_kv {
+                    kv.narrow(1, n - max_kv, max_kv)?.contiguous()?
+                } else {
+                    kv
+                };
+                cache.layers[i].kv = Some(trimmed);
+            }
+        }
+        Ok(x)
+    }
+
     pub fn forward_full(&self, mel: &Tensor, with_chunked_mask: bool) -> Result<Tensor> {
         let x = self.subsample.forward(mel)?;
         let (_b, t_out, _d) = x.dims3()?;
