@@ -289,9 +289,9 @@ async fn main() -> Result<()> {
                 // 2 s probe window — covers the "Recognition ready."
                 // utterance plus its tail so the gain estimate
                 // averages over a real-room acoustic transient.
-                cal_probe = Some(CalibrationProbe::new(
-                    std::time::Duration::from_millis(2_000),
-                ));
+                cal_probe = Some(CalibrationProbe::new(std::time::Duration::from_millis(
+                    2_000,
+                )));
             }
             Err(e) => tracing::warn!("calibration POST {url} failed: {e:#}"),
         },
@@ -386,10 +386,7 @@ async fn main() -> Result<()> {
                 // AEC3's "is this real echo?" gate may be disabling
                 // adaptation in the live test.
                 if let Some(probe) = cal_probe.as_mut() {
-                    if probe.observe_mic_and_maybe_flush(
-                        &chunk.samples,
-                        ref_history.as_deref(),
-                    ) {
+                    if probe.observe_mic_and_maybe_flush(&chunk.samples, ref_history.as_deref()) {
                         // Window expired and the line was emitted; drop
                         // the probe so we stop checking the deadline
                         // every iteration.
