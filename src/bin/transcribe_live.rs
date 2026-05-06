@@ -281,9 +281,18 @@ async fn main() -> Result<()> {
     // kernel has a clean signal to lock onto before the user talks.
     // Best-effort — failures here don't bring the daemon down. Only
     // meaningful with --reference-listen; warn-and-skip otherwise.
+    let mut cal_probe: Option<CalibrationProbe> = None;
     match (&args.reference_listen, &args.calibrate_url) {
         (Some(_), Some(url)) => match calibrate_post(url) {
-            Ok(()) => eprintln!("calibration POST {url} ok"),
+            Ok(()) => {
+                eprintln!("calibration POST {url} ok");
+                // 2 s probe window — covers the "Recognition ready."
+                // utterance plus its tail so the gain estimate
+                // averages over a real-room acoustic transient.
+                cal_probe = Some(CalibrationProbe::new(
+                    std::time::Duration::from_millis(2_000),
+                ));
+            }
             Err(e) => tracing::warn!("calibration POST {url} failed: {e:#}"),
         },
         (None, Some(_)) => {
@@ -360,12 +369,31 @@ async fn main() -> Result<()> {
                     ref_history.as_ref(),
                 ) {
                     let stats = kernel.last_frame_stats().copied();
-                    if logger.observe(chunk.samples.len(), stats.as_ref()) {
+                    if logger.observe(&chunk.samples, stats.as_ref()) {
                         let (rb_len, rb_cap) = match hist.lock() {
                             Ok(h) => (h.len(), h.capacity()),
                             Err(_) => (0, 0),
                         };
                         logger.flush(kernel.as_ref(), rb_len, rb_cap);
+                    }
+                }
+
+                // Calibration-window chain-gain probe. Active for the
+                // first ~2 s after the calibration POST returns; logs
+                // mic_rms / ref_rms / mic-vs-ref dB once. The gain
+                // measurement here IS the chain (speaker amp × room
+                // attenuation × mic preamp) — if it sits far from 0 dB,
+                // AEC3's "is this real echo?" gate may be disabling
+                // adaptation in the live test.
+                if let Some(probe) = cal_probe.as_mut() {
+                    if probe.observe_mic_and_maybe_flush(
+                        &chunk.samples,
+                        ref_history.as_deref(),
+                    ) {
+                        // Window expired and the line was emitted; drop
+                        // the probe so we stop checking the deadline
+                        // every iteration.
+                        cal_probe = None;
                     }
                 }
                 let prev_total = pipe.all_tokens.len();
@@ -437,6 +465,110 @@ async fn main() -> Result<()> {
 /// kept local so the logger doesn't need a candle dep.
 const SR_HZ: usize = 16_000;
 
+/// Calibration-window probe: started after the `/calibrate` POST
+/// returns, accumulates mic samples received during the next
+/// `duration_ms`, and at the end snapshots the same number of recent
+/// reference samples. The mic RMS / ref RMS ratio is the actual
+/// end-to-end chain gain in this room (speaker amp × room
+/// attenuation × mic preamp) — known to be a live-mode failure mode
+/// for AEC3's adaptation gate (mic ≫ ref or mic ≪ ref pushes the
+/// implied room IR outside ‖h‖ ≤ 1, which the gate uses to decide
+/// whether there's "real echo" to cancel).
+///
+/// Reports once at INFO when the window closes; afterwards the main
+/// loop drops the probe so we don't pay the deadline-check cost on
+/// every chunk for the rest of the run.
+struct CalibrationProbe {
+    deadline: std::time::Instant,
+    sum_mic_e: f64,
+    n_mic_samples: usize,
+}
+
+impl CalibrationProbe {
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            deadline: std::time::Instant::now() + window,
+            sum_mic_e: 0.0,
+            n_mic_samples: 0,
+        }
+    }
+
+    /// Accumulate the latest mic frame; if the window has now expired,
+    /// emit the calibration line (using `ref_history` for the matched
+    /// ref window) and return `true` so the caller drops the probe.
+    fn observe_mic_and_maybe_flush(
+        &mut self,
+        mic: &[f32],
+        ref_history: Option<&Mutex<ReferenceHistory>>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        if now < self.deadline {
+            for &x in mic {
+                self.sum_mic_e += (x as f64) * (x as f64);
+            }
+            self.n_mic_samples += mic.len();
+            return false;
+        }
+        // Window closed — compute and report.
+        let mic_rms = if self.n_mic_samples > 0 {
+            (self.sum_mic_e / self.n_mic_samples as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+        // Match the ref-side measurement to the mic sample count by
+        // taking the most recent N ref samples from the ring. They're
+        // the closest in wall-clock to the calibration utterance.
+        let (ref_rms, n_ref) = match ref_history {
+            None => (0.0, 0),
+            Some(mtx) => match mtx.lock() {
+                Err(_) => (0.0, 0),
+                Ok(h) => {
+                    let snap = h.snapshot();
+                    let n = self.n_mic_samples.min(snap.len());
+                    if n == 0 {
+                        (0.0, 0)
+                    } else {
+                        let window = &snap[snap.len() - n..];
+                        let mut acc = 0f64;
+                        for &x in window {
+                            acc += (x as f64) * (x as f64);
+                        }
+                        let rms = (acc / n as f64).sqrt() as f32;
+                        (rms, n)
+                    }
+                }
+            },
+        };
+        let mic_dbfs = if mic_rms > 1e-9 {
+            20.0 * mic_rms.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+        let ref_dbfs = if ref_rms > 1e-9 {
+            20.0 * ref_rms.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+        let chain_db = if mic_rms > 1e-9 && ref_rms > 1e-9 {
+            20.0 * (mic_rms / ref_rms).log10()
+        } else {
+            f32::NAN
+        };
+        tracing::info!(
+            "calibration: mic={:+.1}dBFS ({:.4} rms) ref={:+.1}dBFS ({:.4} rms) chain={:+.1}dB \
+             over {} mic samples / {} ref samples",
+            mic_dbfs,
+            mic_rms,
+            ref_dbfs,
+            ref_rms,
+            chain_db,
+            self.n_mic_samples,
+            n_ref,
+        );
+        true
+    }
+}
+
 /// Aggregator for per-second AEC stats. Sums frame energies over a
 /// window of mic samples; once the window crosses one second, emits a
 /// single tracing::info line and resets. ERLE is computed from the
@@ -447,10 +579,18 @@ struct AecLogger {
     /// crosses `samples_per_log`.
     samples_in_window: usize,
     samples_per_log: usize,
+    /// Total mic energy across the window — surfaced as dBFS even when
+    /// the kernel didn't engage, so the operator can read mic levels
+    /// during ref-silent stretches.
+    sum_mic_window_energy: f64,
     /// Aggregated frame energies — only over frames where the kernel
     /// engaged (ref above silence floor). ERLE = 10·log10(mic/cleaned).
+    /// `ref_frame_energy` accumulator backs the chain-gain (mic/ref dB)
+    /// readout — Andrew's diagnostic for "is AEC3's gate disabling
+    /// adaptation because the mic-vs-ref amplitude ratio looks wrong?"
     sum_mic_frame_energy: f32,
     sum_cleaned_frame_energy: f32,
+    sum_ref_frame_energy: f32,
     /// Aggregated soft signals — averaged across active frames.
     sum_confidence: f32,
     sum_gain: f32,
@@ -465,8 +605,10 @@ impl AecLogger {
         Self {
             samples_in_window: 0,
             samples_per_log: sample_rate,
+            sum_mic_window_energy: 0.0,
             sum_mic_frame_energy: 0.0,
             sum_cleaned_frame_energy: 0.0,
+            sum_ref_frame_energy: 0.0,
             sum_confidence: 0.0,
             sum_gain: 0.0,
             active_frames: 0,
@@ -477,13 +619,18 @@ impl AecLogger {
 
     /// Record a frame's stats. Returns true once the accumulated mic
     /// time crosses `samples_per_log` — the caller should then call
-    /// `flush()`.
-    fn observe(&mut self, mic_samples: usize, stats: Option<&FrameStats>) -> bool {
-        self.samples_in_window += mic_samples;
+    /// `flush()`. We take the mic samples directly so we can compute
+    /// mic dBFS even on frames where the kernel passed through.
+    fn observe(&mut self, mic: &[f32], stats: Option<&FrameStats>) -> bool {
+        self.samples_in_window += mic.len();
         self.total_frames += 1;
+        for &s in mic {
+            self.sum_mic_window_energy += (s as f64) * (s as f64);
+        }
         if let Some(s) = stats {
             self.sum_mic_frame_energy += s.mic_frame_energy;
             self.sum_cleaned_frame_energy += s.cleaned_frame_energy;
+            self.sum_ref_frame_energy += s.ref_frame_energy;
             self.sum_confidence += s.confidence;
             self.sum_gain += s.gain;
             self.active_frames += 1;
@@ -500,13 +647,51 @@ impl AecLogger {
         } else {
             0.0
         };
+        // Mic dBFS from the WINDOW's raw samples (always meaningful).
+        // Reference 0 dBFS = 1.0 amplitude. -inf if silent.
+        let mic_rms = if self.samples_in_window > 0 {
+            (self.sum_mic_window_energy / self.samples_in_window as f64).sqrt() as f32
+        } else {
+            0.0
+        };
+        let mic_dbfs = if mic_rms > 1e-9 {
+            20.0 * mic_rms.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
         if self.active_frames > 0 {
             let erle_db = 10.0
                 * (self.sum_mic_frame_energy / self.sum_cleaned_frame_energy.max(1e-12)).log10();
             let avg_conf = self.sum_confidence / self.active_frames as f32;
             let avg_gain = self.sum_gain / self.active_frames as f32;
+            // Per-frame mic / ref RMS over the active frames only.
+            // These are the values AEC3's gate sees — if the ratio is
+            // way off ‖h‖ ≤ 1 (mic louder than ref) it'll disable
+            // adaptation regardless of how good the kernel is.
+            let active_samples = (self.active_frames as usize)
+                * (self.samples_in_window / self.total_frames.max(1) as usize);
+            let active_mic_rms = if active_samples > 0 {
+                (self.sum_mic_frame_energy / active_samples as f32).sqrt()
+            } else {
+                0.0
+            };
+            let active_ref_rms = if active_samples > 0 {
+                (self.sum_ref_frame_energy / active_samples as f32).sqrt()
+            } else {
+                0.0
+            };
+            let chain_db = if active_ref_rms > 1e-9 && active_mic_rms > 1e-9 {
+                20.0 * (active_mic_rms / active_ref_rms).log10()
+            } else {
+                f32::NAN
+            };
+            let ref_dbfs = if active_ref_rms > 1e-9 {
+                20.0 * active_ref_rms.log10()
+            } else {
+                f32::NEG_INFINITY
+            };
             tracing::info!(
-                "aec t={}s ref_buf={}/{} ({:.0}%) active={}/{} delay={:.1}ms gain={:+.3} conf={:.2} ERLE={:+.1}dB since_lock={}",
+                "aec t={}s ref_buf={}/{} ({:.0}%) active={}/{} delay={:.1}ms gain={:+.3} conf={:.2} ERLE={:+.1}dB mic={:+.1}dBFS ref={:+.1}dBFS chain={:+.1}dB since_lock={}",
                 self.log_seq,
                 ref_buf_len,
                 ref_buf_cap,
@@ -517,28 +702,36 @@ impl AecLogger {
                 avg_gain,
                 avg_conf,
                 erle_db,
+                mic_dbfs,
+                ref_dbfs,
+                chain_db,
                 frames_since_lock,
             );
         } else {
             // ref was below the silence floor (or insufficient history)
             // for the whole window — ERLE is meaningless, mic was passed
-            // through unchanged. Useful in itself: tells the operator
-            // the daemon isn't seeing reference audio yet.
+            // through unchanged. We still print mic dBFS so the operator
+            // can confirm the daemon is at least seeing mic input
+            // (helpful for diagnosing "ref_buf=0 forever" — is the mic
+            // also broken or just the reference path?).
             tracing::info!(
-                "aec t={}s ref_buf={}/{} ({:.0}%) ref=silent active=0/{} delay={:.1}ms since_lock={}",
+                "aec t={}s ref_buf={}/{} ({:.0}%) ref=silent active=0/{} delay={:.1}ms mic={:+.1}dBFS since_lock={}",
                 self.log_seq,
                 ref_buf_len,
                 ref_buf_cap,
                 buf_pct,
                 self.total_frames,
                 delay_ms,
+                mic_dbfs,
                 frames_since_lock,
             );
         }
         // Reset window; counters carry forward via log_seq only.
         self.samples_in_window = 0;
+        self.sum_mic_window_energy = 0.0;
         self.sum_mic_frame_energy = 0.0;
         self.sum_cleaned_frame_energy = 0.0;
+        self.sum_ref_frame_energy = 0.0;
         self.sum_confidence = 0.0;
         self.sum_gain = 0.0;
         self.active_frames = 0;

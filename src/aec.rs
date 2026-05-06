@@ -195,6 +195,14 @@ pub struct FrameStats {
     pub mic_frame_energy: f32,
     /// Energy of *just this frame's* cleaned output — needed for ERLE.
     pub cleaned_frame_energy: f32,
+    /// Energy of the most-recent `mic_frame.len()` ref samples — i.e.
+    /// the ref samples sharing the same time window as the mic frame.
+    /// Used (alongside `mic_frame_energy`) for the chain-gain
+    /// diagnostic: AEC3 expects mic ≈ h·ref with ‖h‖ ≤ 1, and a wildly
+    /// off mic/ref RMS ratio in our UDP-decoupled chain is a likely
+    /// reason live ERLE collapses. Surfacing both makes the ratio
+    /// readable in the per-second log.
+    pub ref_frame_energy: f32,
 }
 
 impl AecKernel for SpectralSubtractionAec {
@@ -349,6 +357,10 @@ impl AecKernel for SpectralSubtractionAec {
         // number even when individual frames are noisy.
         let mic_frame_energy = dot(mic_frame, mic_frame);
         let cleaned_frame_energy = dot(&out, &out);
+        // Energy of the most-recent `n` ref samples, regardless of the
+        // kernel's chosen alignment delay — for chain-gain diagnostic.
+        let recent_ref = &ref_history[ref_history.len() - n..];
+        let ref_frame_energy = dot(recent_ref, recent_ref);
         self.last_stats = Some(FrameStats {
             best_d,
             confidence,
@@ -357,6 +369,7 @@ impl AecKernel for SpectralSubtractionAec {
             ref_energy: probe_ref_energy,
             mic_frame_energy,
             cleaned_frame_energy,
+            ref_frame_energy,
         });
 
         out
@@ -567,6 +580,9 @@ impl AecKernel for NlmsAec {
         // - mic_energy / ref_energy keep the long-window meaning
         //   (frame-level here, since NLMS doesn't carry a separate
         //   long buffer).
+        // Energy of the most-recent n ref samples — for chain-gain diagnostic.
+        let recent_ref = &ref_history[ref_history.len() - n..];
+        let ref_frame_energy = dot(recent_ref, recent_ref);
         self.last_stats = Some(FrameStats {
             best_d: peak_idx,
             confidence: if in_double_talk { 0.0 } else { 1.0 },
@@ -575,6 +591,7 @@ impl AecKernel for NlmsAec {
             ref_energy: ref_block_e,
             mic_frame_energy: frame_mic_e,
             cleaned_frame_energy: frame_clean_e,
+            ref_frame_energy,
         });
 
         out
@@ -675,7 +692,6 @@ impl AecKernel for WebrtcAec {
 
         let ref_tail = &ref_history[ref_history.len() - required_ref..];
         let mut out = Vec::with_capacity(n_blocks * frame_len);
-        let mut last_stats = None;
 
         for block_idx in 0..n_blocks {
             let start = block_idx * frame_len;
@@ -702,31 +718,34 @@ impl AecKernel for WebrtcAec {
             }
 
             let processed = capture_frame.pop().unwrap_or_default();
-            let mic_energy = dot(&mic_frame[start..end], &mic_frame[start..end]);
-            let cleaned_frame_energy = dot(&processed, &processed);
-            let ref_energy = dot(&ref_tail[start..end], &ref_tail[start..end]);
-            let stats = self.processor.get_stats();
-            last_stats = Some(FrameStats {
-                best_d: Self::sample_rate_to_samples(stats.delay_median_ms),
-                confidence: stats
-                    .voice_detected
-                    .map(|v| if v { 1.0 } else { 0.0 })
-                    .unwrap_or(0.0),
-                gain: stats.echo_return_loss_enhancement.unwrap_or(0.0) as f32,
-                mic_energy,
-                ref_energy,
-                mic_frame_energy: mic_energy,
-                cleaned_frame_energy,
-            });
-            self.frames_since_lock = if stats.delay_median_ms.is_some() {
-                0
-            } else {
-                self.frames_since_lock.saturating_add(1)
-            };
             out.extend_from_slice(&processed);
         }
 
-        self.last_stats = last_stats;
+        // Frame-level totals (across all blocks of this mic frame).
+        // Stats from the library reflect AEC3's most recent internal
+        // update — we keep just the last per-frame snapshot.
+        let mic_frame_energy = dot(mic_frame, mic_frame);
+        let cleaned_frame_energy = dot(&out, &out);
+        let ref_frame_energy = dot(ref_tail, ref_tail);
+        let stats = self.processor.get_stats();
+        self.last_stats = Some(FrameStats {
+            best_d: Self::sample_rate_to_samples(stats.delay_median_ms),
+            confidence: stats
+                .voice_detected
+                .map(|v| if v { 1.0 } else { 0.0 })
+                .unwrap_or(0.0),
+            gain: stats.echo_return_loss_enhancement.unwrap_or(0.0) as f32,
+            mic_energy: mic_frame_energy,
+            ref_energy: ref_frame_energy,
+            mic_frame_energy,
+            cleaned_frame_energy,
+            ref_frame_energy,
+        });
+        self.frames_since_lock = if stats.delay_median_ms.is_some() {
+            0
+        } else {
+            self.frames_since_lock.saturating_add(1)
+        };
         out
     }
 
