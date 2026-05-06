@@ -10,8 +10,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{LSTMConfig, RNN, VarBuilder, lstm};
 
 pub struct PredictNet {
-    embed: Tensor,                  // (vocab_size + 1, pred_hidden)
-    lstm: Vec<candle_nn::LSTM>,     // length = pred_rnn_layers
+    embed: Tensor,              // (vocab_size + 1, pred_hidden)
+    lstm: Vec<candle_nn::LSTM>, // length = pred_rnn_layers
     pred_hidden: usize,
     device: Device,
     dtype: DType,
@@ -24,7 +24,13 @@ pub struct PredictState {
 }
 
 impl PredictState {
-    pub fn zero(layers: usize, batch: usize, hidden: usize, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn zero(
+        layers: usize,
+        batch: usize,
+        hidden: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let mut h = Vec::with_capacity(layers);
         let mut c = Vec::with_capacity(layers);
         for _ in 0..layers {
@@ -42,13 +48,17 @@ impl PredictNet {
             .context("embed weight")?;
         let mut lstm_layers = Vec::with_capacity(cfg.pred_rnn_layers);
         for i in 0..cfg.pred_rnn_layers {
-            let in_dim = if i == 0 { cfg.pred_hidden } else { cfg.pred_hidden };
+            let in_dim = if i == 0 {
+                cfg.pred_hidden
+            } else {
+                cfg.pred_hidden
+            };
             let cfg_l = LSTMConfig {
                 layer_idx: i,
                 ..LSTMConfig::default()
             };
-            let layer = lstm(in_dim, cfg.pred_hidden, cfg_l, vb.pp("lstm"))
-                .context("lstm layer")?;
+            let layer =
+                lstm(in_dim, cfg.pred_hidden, cfg_l, vb.pp("lstm")).context("lstm layer")?;
             lstm_layers.push(layer);
         }
         Ok(Self {
@@ -67,11 +77,17 @@ impl PredictNet {
     /// Single-step forward at greedy decoding time. `last_token` is `None`
     /// at the very start (SOS = zero embedding), or `Some(idx)` to look up
     /// the embedding for the previously emitted non-blank token.
-    pub fn step(&self, last_token: Option<usize>, state: &PredictState) -> Result<(Tensor, PredictState)> {
+    pub fn step(
+        &self,
+        last_token: Option<usize>,
+        state: &PredictState,
+    ) -> Result<(Tensor, PredictState)> {
         let batch = 1usize;
         // Build input: (B, pred_hidden)
         let x = match last_token {
-            None => Tensor::zeros((batch, self.pred_hidden), self.dtype, &self.device)?.contiguous()?,
+            None => {
+                Tensor::zeros((batch, self.pred_hidden), self.dtype, &self.device)?.contiguous()?
+            }
             Some(idx) => {
                 // gather row idx from embed -> (B, pred_hidden)
                 let idx_t = Tensor::from_vec(vec![idx as u32], (batch,), &self.device)?;

@@ -94,15 +94,13 @@ impl StreamingPipeline {
         let total_mel = self.mel.n_frames_emitted();
         let new_mel = total_mel - self.mel_consumed;
         let mel_finished = self.mel.is_finished();
-        let need_call =
-            new_mel > 0 || (mel_finished && !self.sub_state.is_finalized());
+        let need_call = new_mel > 0 || (mel_finished && !self.sub_state.is_finalized());
         if !need_call {
             return Ok(());
         }
         let n_mels = self.mel_cfg.n_mels;
         let slice = self.mel.mel_buffer_since(self.mel_consumed);
-        let new_tensor =
-            Tensor::from_vec(slice, (1, n_mels, new_mel), &self.device)?;
+        let new_tensor = Tensor::from_vec(slice, (1, n_mels, new_mel), &self.device)?;
         self.encoder
             .subsample
             .forward_incremental(

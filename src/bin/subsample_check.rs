@@ -90,10 +90,17 @@ fn main() -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no incremental output produced"))?;
     let inc_dims = inc.dims().to_vec();
-    println!("incremental ({} mel-frame slices): {:?}", args.slice, inc_dims);
+    println!(
+        "incremental ({} mel-frame slices): {:?}",
+        args.slice, inc_dims
+    );
 
     if off_dims != inc_dims {
-        bail!("shape mismatch: offline {:?} vs incremental {:?}", off_dims, inc_dims);
+        bail!(
+            "shape mismatch: offline {:?} vs incremental {:?}",
+            off_dims,
+            inc_dims
+        );
     }
     let off_v: Vec<f32> = off.flatten_all()?.to_vec1()?;
     let inc_v: Vec<f32> = inc.flatten_all()?.to_vec1()?;

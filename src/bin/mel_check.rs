@@ -29,8 +29,7 @@ struct Args {
 }
 
 fn read_reference_bin(path: &std::path::Path) -> Result<(usize, usize, Vec<f32>)> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     if bytes.len() < 8 {
         bail!("reference too short");
     }
@@ -133,7 +132,10 @@ fn main() -> Result<()> {
     );
 
     if max_abs > args.atol {
-        eprintln!("FAIL: max diff {:.3e} exceeds tolerance {:.3e}", max_abs, args.atol);
+        eprintln!(
+            "FAIL: max diff {:.3e} exceeds tolerance {:.3e}",
+            max_abs, args.atol
+        );
         std::process::exit(1);
     }
     println!("OK: mel matches reference within {:.3e}", args.atol);

@@ -22,9 +22,9 @@ use candle_nn::VarBuilder;
 use clap::Parser;
 use nemotron_speech::aec::{AecKernel, ReferenceHistory, SpectralSubtractionAec};
 use nemotron_speech::audio::load_audio_mono_16k;
-use nemotron_speech::audio_source::{AudioSource, FileChunkSource, UdpSource};
 #[cfg(feature = "mic")]
 use nemotron_speech::audio_source::mic::MicSource;
+use nemotron_speech::audio_source::{AudioSource, FileChunkSource, UdpSource};
 use nemotron_speech::features::{IncrementalMelExtractor, MelConfig};
 use nemotron_speech::model::ModelConfig;
 use nemotron_speech::model::encoder::FastConformerEncoder;
@@ -94,11 +94,17 @@ async fn main() -> Result<()> {
         Device::Cpu
     } else {
         #[cfg(feature = "metal")]
-        { Device::new_metal(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        { Device::new_cuda(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_cuda(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        { Device::Cpu }
+        {
+            Device::Cpu
+        }
     };
     let dtype = DType::F32;
     eprintln!("device: {:?}", device);
@@ -112,15 +118,13 @@ async fn main() -> Result<()> {
     let cfg = ModelConfig::nemotron_06b();
     let encoder = FastConformerEncoder::new(vb.pp("encoder"), cfg.clone())
         .map_err(|e| anyhow::anyhow!("encoder: {e:#}"))?;
-    let predict = PredictNet::new(vb.pp("predict"), &cfg)
-        .map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
-    let joint = JointNet::new(vb.pp("joint"), &cfg)
-        .map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
+    let predict =
+        PredictNet::new(vb.pp("predict"), &cfg).map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
+    let joint = JointNet::new(vb.pp("joint"), &cfg).map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
     let tok = Tokenizer::from_file(&args.tok)?;
 
-    let mut pipe = StreamingPipeline::new(
-        encoder, predict, joint, mel, mel_cfg, cfg, device, dtype,
-    )?;
+    let mut pipe =
+        StreamingPipeline::new(encoder, predict, joint, mel, mel_cfg, cfg, device, dtype)?;
 
     let mut source: Box<dyn AudioSource> = if let Some(p) = &args.audio {
         let samples = load_audio_mono_16k(p)?;
@@ -240,19 +244,17 @@ async fn main() -> Result<()> {
                 // AEC: if a reference stream is wired up, snapshot the
                 // ring buffer (cheap memcpy, ~50 KB) and run the kernel.
                 // The snapshot avoids holding the lock across the kernel.
-                let cleaned: Option<Vec<f32>> =
-                    match (&ref_history, aec_kernel.as_mut()) {
-                        (Some(hist), Some(kernel)) => {
-                            let snap = match hist.lock() {
-                                Ok(h) => h.snapshot(),
-                                Err(_) => Vec::new(),
-                            };
-                            Some(kernel.process(&chunk.samples, &snap))
-                        }
-                        _ => None,
-                    };
-                let samples_for_pipe: &[f32] =
-                    cleaned.as_deref().unwrap_or(&chunk.samples);
+                let cleaned: Option<Vec<f32>> = match (&ref_history, aec_kernel.as_mut()) {
+                    (Some(hist), Some(kernel)) => {
+                        let snap = match hist.lock() {
+                            Ok(h) => h.snapshot(),
+                            Err(_) => Vec::new(),
+                        };
+                        Some(kernel.process(&chunk.samples, &snap))
+                    }
+                    _ => None,
+                };
+                let samples_for_pipe: &[f32] = cleaned.as_deref().unwrap_or(&chunk.samples);
                 pipe.push_audio(samples_for_pipe);
                 if is_final {
                     pipe.finish();
@@ -290,8 +292,8 @@ async fn main() -> Result<()> {
                     if args.coalesce_text {
                         // Accumulate; ship the whole utterance on idle/final.
                         utterance_buf.push_str(&new_chunk_text);
-                        let utterance_done = (idle_long_enough || is_final)
-                            && !utterance_buf.is_empty();
+                        let utterance_done =
+                            (idle_long_enough || is_final) && !utterance_buf.is_empty();
                         if utterance_done {
                             let mut payload = Vec::with_capacity(utterance_buf.len() + 1);
                             payload.extend_from_slice(utterance_buf.as_bytes());

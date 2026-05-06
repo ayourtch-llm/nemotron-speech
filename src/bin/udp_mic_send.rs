@@ -59,7 +59,12 @@ fn main() -> Result<()> {
     let config = device.default_input_config()?;
     let src_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
-    eprintln!("mic: {} Hz, {} channel(s), {:?}", src_rate, channels, config.sample_format());
+    eprintln!(
+        "mic: {} Hz, {} channel(s), {:?}",
+        src_rate,
+        channels,
+        config.sample_format()
+    );
 
     let target_rate = 16_000u32;
     let err_fn = |e| tracing::warn!("mic stream error: {e:?}");
@@ -115,7 +120,9 @@ fn main() -> Result<()> {
             let elapsed = now.duration_since(started).as_secs_f32();
             eprintln!(
                 "sent {} datagrams in {:.1}s ({:.0} pkt/s)",
-                datagrams, elapsed, datagrams as f32 / elapsed
+                datagrams,
+                elapsed,
+                datagrams as f32 / elapsed
             );
             last_log = now;
         }

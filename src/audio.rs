@@ -52,10 +52,7 @@ pub fn load_audio_mono_16k<P: AsRef<Path>>(path: P) -> Result<Vec<f32>> {
     let src_sr = codec_params
         .sample_rate
         .ok_or_else(|| anyhow!("missing sample rate"))?;
-    let n_channels = codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(1);
+    let n_channels = codec_params.channels.map(|c| c.count()).unwrap_or(1);
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())

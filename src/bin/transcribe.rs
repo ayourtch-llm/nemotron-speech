@@ -60,11 +60,17 @@ fn main() -> Result<()> {
         // when neither GPU feature is enabled. Metal and CUDA are assumed
         // mutually exclusive (macOS vs Linux).
         #[cfg(feature = "metal")]
-        { Device::new_metal(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        { Device::new_cuda(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_cuda(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        { Device::Cpu }
+        {
+            Device::Cpu
+        }
     };
     let dtype = DType::F32;
     println!("device: {:?}, dtype: {:?}", device, dtype);
@@ -104,10 +110,9 @@ fn main() -> Result<()> {
     println!("encoder loaded in {:?}", t0.elapsed());
 
     println!("loading predict + joint...");
-    let predict = PredictNet::new(vb.pp("predict"), &cfg)
-        .map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
-    let joint = JointNet::new(vb.pp("joint"), &cfg)
-        .map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
+    let predict =
+        PredictNet::new(vb.pp("predict"), &cfg).map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
+    let joint = JointNet::new(vb.pp("joint"), &cfg).map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
 
     // Encoder forward
     println!("encoder forward...");
@@ -115,7 +120,11 @@ fn main() -> Result<()> {
     let enc_out = encoder
         .forward_full(&mel_t, args.chunked_mask)
         .map_err(|e| anyhow::anyhow!("encoder forward: {e:#}"))?;
-    println!("encoder forward took {:?}; output shape {:?}", t0.elapsed(), enc_out.dims());
+    println!(
+        "encoder forward took {:?}; output shape {:?}",
+        t0.elapsed(),
+        enc_out.dims()
+    );
 
     // Greedy decode
     let mut dec = GreedyDecoder::new(

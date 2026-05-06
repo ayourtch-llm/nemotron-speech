@@ -41,7 +41,11 @@ pub struct FileChunkSource {
 impl FileChunkSource {
     pub fn new(samples: Vec<f32>, chunk_samples: usize) -> Self {
         assert!(chunk_samples > 0);
-        Self { samples, pos: 0, chunk_samples }
+        Self {
+            samples,
+            pos: 0,
+            chunk_samples,
+        }
     }
 }
 
@@ -59,7 +63,10 @@ impl AudioSource for FileChunkSource {
         let chunk = self.samples[self.pos..end].to_vec();
         let is_final = end == self.samples.len();
         self.pos = end;
-        Ok(Some(AudioChunk { samples: chunk, is_final }))
+        Ok(Some(AudioChunk {
+            samples: chunk,
+            is_final,
+        }))
     }
 }
 
@@ -134,7 +141,10 @@ impl AudioSource for UdpSource {
         }
         let chunk: Vec<f32> = self.buffer.drain(..self.chunk_samples).collect();
         // UDP streams are open-ended — the caller stops when they want.
-        Ok(Some(AudioChunk { samples: chunk, is_final: false }))
+        Ok(Some(AudioChunk {
+            samples: chunk,
+            is_final: false,
+        }))
     }
 }
 
@@ -259,13 +269,19 @@ pub mod mic {
                             return Ok(None);
                         }
                         let chunk = std::mem::take(&mut self.buffer);
-                        return Ok(Some(AudioChunk { samples: chunk, is_final: true }));
+                        return Ok(Some(AudioChunk {
+                            samples: chunk,
+                            is_final: true,
+                        }));
                     }
                 }
             }
             let mut chunk: Vec<f32> = Vec::with_capacity(self.chunk_samples);
             chunk.extend(self.buffer.drain(..self.chunk_samples));
-            Ok(Some(AudioChunk { samples: chunk, is_final: false }))
+            Ok(Some(AudioChunk {
+                samples: chunk,
+                is_final: false,
+            }))
         }
     }
 }

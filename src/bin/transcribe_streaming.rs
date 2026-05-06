@@ -52,11 +52,17 @@ fn main() -> Result<()> {
         Device::Cpu
     } else {
         #[cfg(feature = "metal")]
-        { Device::new_metal(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(all(feature = "cuda", not(feature = "metal")))]
-        { Device::new_cuda(0).unwrap_or(Device::Cpu) }
+        {
+            Device::new_cuda(0).unwrap_or(Device::Cpu)
+        }
         #[cfg(not(any(feature = "metal", feature = "cuda")))]
-        { Device::Cpu }
+        {
+            Device::Cpu
+        }
     };
     let dtype = DType::F32;
     println!("device: {:?}", device);
@@ -81,10 +87,9 @@ fn main() -> Result<()> {
     let cfg = ModelConfig::nemotron_06b();
     let encoder = FastConformerEncoder::new(vb.pp("encoder"), cfg.clone())
         .map_err(|e| anyhow::anyhow!("encoder: {e:#}"))?;
-    let predict = PredictNet::new(vb.pp("predict"), &cfg)
-        .map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
-    let joint = JointNet::new(vb.pp("joint"), &cfg)
-        .map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
+    let predict =
+        PredictNet::new(vb.pp("predict"), &cfg).map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
+    let joint = JointNet::new(vb.pp("joint"), &cfg).map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
     let tok = Tokenizer::from_file(&args.tok)?;
 
     // Subsample once (offline).
@@ -147,10 +152,6 @@ fn main() -> Result<()> {
         }
     }
     println!();
-    println!(
-        "\ntotal: {} tokens in {:?}",
-        all_tokens.len(),
-        t0.elapsed()
-    );
+    println!("\ntotal: {} tokens in {:?}", all_tokens.len(), t0.elapsed());
     Ok(())
 }

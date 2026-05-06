@@ -24,21 +24,27 @@ impl JointNet {
             let w = vb
                 .get((cfg.joint_hidden, cfg.d_model), "enc.weight")
                 .context("joint enc weight")?;
-            let b = vb.get(cfg.joint_hidden, "enc.bias").context("joint enc bias")?;
+            let b = vb
+                .get(cfg.joint_hidden, "enc.bias")
+                .context("joint enc bias")?;
             Linear::new(w, Some(b))
         };
         let pred = {
             let w = vb
                 .get((cfg.joint_hidden, cfg.pred_hidden), "pred.weight")
                 .context("joint pred weight")?;
-            let b = vb.get(cfg.joint_hidden, "pred.bias").context("joint pred bias")?;
+            let b = vb
+                .get(cfg.joint_hidden, "pred.bias")
+                .context("joint pred bias")?;
             Linear::new(w, Some(b))
         };
         let out = {
             let w = vb
                 .get((cfg.vocab_size + 1, cfg.joint_hidden), "out.weight")
                 .context("joint out weight")?;
-            let b = vb.get(cfg.vocab_size + 1, "out.bias").context("joint out bias")?;
+            let b = vb
+                .get(cfg.vocab_size + 1, "out.bias")
+                .context("joint out bias")?;
             Linear::new(w, Some(b))
         };
         Ok(Self { enc, pred, out })

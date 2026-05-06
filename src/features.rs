@@ -48,8 +48,8 @@ impl MelConfig {
 /// mel filterbank read from the model's checkpoint.
 pub struct MelExtractor {
     cfg: MelConfig,
-    window: Vec<f32>,           // (win_length,)
-    mel_fb: Vec<f32>,           // row-major (n_mels, n_fft/2 + 1)
+    window: Vec<f32>, // (win_length,)
+    mel_fb: Vec<f32>, // row-major (n_mels, n_fft/2 + 1)
     fft: Arc<dyn RealToComplex<f32>>,
     in_buf: Vec<f32>,           // length n_fft, scratch for one frame
     out_buf: Vec<Complex<f32>>, // length n_fft/2 + 1, scratch for one frame
@@ -483,10 +483,7 @@ fn read_f32_tensor(st: &safetensors::SafeTensors, name: &str) -> Result<Vec<f32>
         .tensor(name)
         .with_context(|| format!("missing tensor {name}"))?;
     if !matches!(view.dtype(), safetensors::Dtype::F32) {
-        return Err(anyhow!(
-            "expected f32 for {name}, got {:?}",
-            view.dtype()
-        ));
+        return Err(anyhow!("expected f32 for {name}, got {:?}", view.dtype()));
     }
     let raw = view.data();
     if raw.len() % 4 != 0 {
@@ -607,6 +604,9 @@ mod tests {
         }
         let inc_t = inc.n_frames_emitted();
         let lag = off_t - inc_t;
-        assert!(lag == 1 || lag == 2, "expected 1–2 frame lag, got {lag} (off={off_t} inc={inc_t})");
+        assert!(
+            lag == 1 || lag == 2,
+            "expected 1–2 frame lag, got {lag} (off={off_t} inc={inc_t})"
+        );
     }
 }

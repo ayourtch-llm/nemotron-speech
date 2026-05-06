@@ -31,7 +31,12 @@ pub struct GreedyDecoder {
 }
 
 impl GreedyDecoder {
-    pub fn new(predict: &PredictNet, cfg: GreedyDecoderConfig, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn new(
+        predict: &PredictNet,
+        cfg: GreedyDecoderConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         let state = PredictState::zero(2, 1, predict.pred_hidden(), device, dtype)?;
         Ok(Self {
             last_token: None,
@@ -44,7 +49,13 @@ impl GreedyDecoder {
     /// Process one encoder output sequence `(T, d_enc)` and append decoded
     /// tokens to `out`. State is updated in place so the next chunk's call
     /// continues from where this one left off.
-    pub fn decode(&mut self, encoded: &Tensor, predict: &PredictNet, joint: &JointNet, out: &mut Vec<u32>) -> Result<()> {
+    pub fn decode(
+        &mut self,
+        encoded: &Tensor,
+        predict: &PredictNet,
+        joint: &JointNet,
+        out: &mut Vec<u32>,
+    ) -> Result<()> {
         let (t_frames, _d) = encoded.dims2()?;
         for t in 0..t_frames {
             // f: (1, d_enc) — one encoder frame as a row.

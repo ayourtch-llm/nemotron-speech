@@ -108,7 +108,11 @@ fn main() -> Result<()> {
     let ref_v: Vec<f32> = ref_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     let stream_v: Vec<f32> = stream_out.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     if ref_v.len() != stream_v.len() {
-        bail!("size mismatch: ref {} vs stream {}", ref_v.len(), stream_v.len());
+        bail!(
+            "size mismatch: ref {} vs stream {}",
+            ref_v.len(),
+            stream_v.len()
+        );
     }
     let mut max_abs = 0.0f32;
     let mut argmax = 0usize;
@@ -129,7 +133,11 @@ fn main() -> Result<()> {
         max_abs, frame_idx, ch_idx, ref_v[argmax], stream_v[argmax], mean
     );
     if max_abs > args.atol {
-        bail!("FAIL: max diff {:.3e} exceeds tol {:.3e}", max_abs, args.atol);
+        bail!(
+            "FAIL: max diff {:.3e} exceeds tol {:.3e}",
+            max_abs,
+            args.atol
+        );
     }
     println!("OK");
     Ok(())

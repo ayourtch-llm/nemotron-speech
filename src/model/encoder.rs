@@ -17,7 +17,7 @@
 
 use crate::model::ModelConfig;
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Module, Tensor, D};
+use candle_core::{D, DType, Device, Module, Tensor};
 use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,9 @@ use candle_nn::{Conv2d, Conv2dConfig, LayerNorm, Linear, VarBuilder};
 // ---------------------------------------------------------------------------
 
 fn linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Linear> {
-    let w = vb.get((out_dim, in_dim), "weight").context("linear weight")?;
+    let w = vb
+        .get((out_dim, in_dim), "weight")
+        .context("linear weight")?;
     let b = if bias {
         Some(vb.get(out_dim, "bias").context("linear bias")?)
     } else {
@@ -143,7 +145,10 @@ impl DwStridingSubsampling {
 
         // (B, C, T', F') -> (B, T', C*F')
         let (_b, c, tp, f) = x.dims4()?;
-        let x = x.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, tp, c * f))?;
+        let x = x
+            .permute((0, 2, 1, 3))?
+            .contiguous()?
+            .reshape((b, tp, c * f))?;
         let x = self.out.forward(&x)?;
         Ok(x)
     }
@@ -222,7 +227,10 @@ impl DwStridingSubsampling {
             state.finalized |= finished;
             return Ok(());
         }
-        let new_enc = x.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, tp, c2 * f2))?;
+        let new_enc = x
+            .permute((0, 2, 1, 3))?
+            .contiguous()?
+            .reshape((b, tp, c2 * f2))?;
         let new_enc = self.out.forward(&new_enc)?; // (1, T_new_2, d_model)
 
         let new_emit = new_enc.dim(1)?;
@@ -247,8 +255,8 @@ impl DwStridingSubsampling {
     /// left off.
     fn stage_run(
         &self,
-        x: Tensor,                    // (B, C_in, T_new, F_in)
-        buf: &mut Tensor,             // (B, C_in, T_buf, F_in)
+        x: Tensor,        // (B, C_in, T_new, F_in)
+        buf: &mut Tensor, // (B, C_in, T_buf, F_in)
         dw_or_conv0: &Conv2d,
         pw: Option<&Conv2d>,
         relu_after: bool,
@@ -291,10 +299,18 @@ impl DwStridingSubsampling {
                 device,
             )?;
             let probe_out = dw_or_conv0.forward(&probe)?;
-            let probe_out = if let Some(pw) = pw { pw.forward(&probe_out)? } else { probe_out };
+            let probe_out = if let Some(pw) = pw {
+                pw.forward(&probe_out)?
+            } else {
+                probe_out
+            };
             let f_out = probe_out.dim(3)?;
             let c_out = probe_out.dim(1)?;
-            return Ok(Tensor::zeros((to_conv.dim(0)?, c_out, 0, f_out), dtype, device)?);
+            return Ok(Tensor::zeros(
+                (to_conv.dim(0)?, c_out, 0, f_out),
+                dtype,
+                device,
+            )?);
         }
 
         // 4) Update buf for next call (skip if finished — no further calls).
@@ -375,10 +391,10 @@ impl FeedForward {
 // ---------------------------------------------------------------------------
 
 pub struct ConvModule {
-    pw1: Conv2d,    // (B, d, 1, T) -> (B, 2d, 1, T)  pointwise
-    dw: Conv2d,     // depthwise k=9 along time, groups=d_model
+    pw1: Conv2d,     // (B, d, 1, T) -> (B, 2d, 1, T)  pointwise
+    dw: Conv2d,      // depthwise k=9 along time, groups=d_model
     norm: LayerNorm, // applied per channel (named `batch_norm` in NeMo but loaded as LN here)
-    pw2: Conv2d,    // (B, d, 1, T) -> (B, d, 1, T)  pointwise
+    pw2: Conv2d,     // (B, d, 1, T) -> (B, d, 1, T)  pointwise
     d_model: usize,
     kernel: usize,
 }
@@ -504,10 +520,11 @@ impl ConvModule {
                     Some(c) => c.clone(),
                     None => Tensor::zeros((b, d, need), x.dtype(), x.device())?,
                 };
-                Tensor::cat(&[
-                    &cache_existing.narrow(D::Minus1, t, need - t)?,
-                    &glu_2d,
-                ], D::Minus1)?.contiguous()?
+                Tensor::cat(
+                    &[&cache_existing.narrow(D::Minus1, t, need - t)?, &glu_2d],
+                    D::Minus1,
+                )?
+                .contiguous()?
             }
         };
 
@@ -686,10 +703,7 @@ impl RelPosMha {
 
         let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = attn.matmul(&v)?; // (B, h, T, dh)
-        let ctx = ctx
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((b, t, h * dh))?;
+        let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, t, h * dh))?;
         let out = self.out.forward(&ctx)?;
         Ok(out)
     }
@@ -973,12 +987,13 @@ impl FastConformerEncoder {
         let subsample = DwStridingSubsampling::new(vb.pp("subsample"), &cfg)?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            layers.push(ConformerLayer::new(
-                vb.pp(format!("layers.{i}")),
-                &cfg,
-            )?);
+            layers.push(ConformerLayer::new(vb.pp(format!("layers.{i}")), &cfg)?);
         }
-        Ok(Self { subsample, layers, cfg })
+        Ok(Self {
+            subsample,
+            layers,
+            cfg,
+        })
     }
 
     /// Offline forward with full attention. `mel`: `(B, n_mels, T)`.
@@ -1009,7 +1024,12 @@ impl FastConformerEncoder {
             .map(|t| t.dims3().map(|(_, n, _)| n).unwrap_or(0))
             .unwrap_or(0);
         let klen = cache_len + t_q;
-        let pos = rel_position_emb(klen, self.cfg.d_model, encoded_chunk.device(), encoded_chunk.dtype())?;
+        let pos = rel_position_emb(
+            klen,
+            self.cfg.d_model,
+            encoded_chunk.device(),
+            encoded_chunk.dtype(),
+        )?;
 
         let max_kv = self.cfg.att_context_size[0];
         let mut x = encoded_chunk.clone();

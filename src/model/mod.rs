@@ -87,13 +87,19 @@ impl RuntimeConfig {
         #[cfg(feature = "metal")]
         {
             if let Ok(d) = Device::new_metal(0) {
-                return Ok(Self { device: d, dtype: DType::F32 });
+                return Ok(Self {
+                    device: d,
+                    dtype: DType::F32,
+                });
             }
         }
         #[cfg(feature = "cuda")]
         {
             if let Ok(d) = Device::new_cuda(0) {
-                return Ok(Self { device: d, dtype: DType::F32 });
+                return Ok(Self {
+                    device: d,
+                    dtype: DType::F32,
+                });
             }
         }
         Ok(Self::cpu_f32())

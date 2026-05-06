@@ -48,12 +48,10 @@ fn read_bin(path: &std::path::Path) -> Result<(Vec<usize>, Vec<f32>)> {
     let mut shape = Vec::with_capacity(ndim);
     let mut off = 4;
     for _ in 0..ndim {
-        shape.push(u32::from_le_bytes([
-            bytes[off],
-            bytes[off + 1],
-            bytes[off + 2],
-            bytes[off + 3],
-        ]) as usize);
+        shape.push(
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]])
+                as usize,
+        );
         off += 4;
     }
     let nelem: usize = shape.iter().product();
@@ -104,11 +102,7 @@ fn read_mel_bin(path: &std::path::Path) -> Result<(Vec<usize>, Vec<f32>)> {
 fn compare(rust: &Tensor, ref_shape: &[usize], ref_data: &[f32], atol: f32) -> Result<()> {
     let dims = rust.dims();
     if dims != ref_shape {
-        bail!(
-            "shape mismatch: rust {:?} vs ref {:?}",
-            dims,
-            ref_shape
-        );
+        bail!("shape mismatch: rust {:?} vs ref {:?}", dims, ref_shape);
     }
     let rust_vec: Vec<f32> = rust.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
     let mut max_abs = 0.0f32;
@@ -128,7 +122,11 @@ fn compare(rust: &Tensor, ref_shape: &[usize], ref_data: &[f32], atol: f32) -> R
         dims, max_abs, rust_vec[argmax], ref_data[argmax], argmax, mean
     );
     if max_abs > atol {
-        bail!("FAIL: max abs {:.3e} exceeds tolerance {:.3e}", max_abs, atol);
+        bail!(
+            "FAIL: max abs {:.3e} exceeds tolerance {:.3e}",
+            max_abs,
+            atol
+        );
     }
     Ok(())
 }
@@ -189,7 +187,9 @@ fn main() -> Result<()> {
                 // bisection is enabled by partial-stage references generated
                 // by the reference script.
                 if args.stage == "layer0" {
-                    let out = layer.forward(&enc, &pos, None).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    let out = layer
+                        .forward(&enc, &pos, None)
+                        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     compare(&out, &ref_shape, &ref_data, args.atol)?;
                 } else {
                     bail!(
