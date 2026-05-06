@@ -104,6 +104,19 @@ struct Args {
         arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])
     )]
     aec_kernel: String,
+    /// AEC3 stream-delay hint in milliseconds — the round-trip
+    /// render-to-capture latency. Without this hint AEC3 runs in
+    /// blind-delay mode and ERLE collapses (Andrew's first live test
+    /// of `--aec-kernel=webrtc` saw 1.5–6.2 dB; the library's own
+    /// `delay_median_ms` was returning None for 50+ seconds — the
+    /// classic "host didn't tell me the delay" symptom). 200 ms is
+    /// a reasonable default for our setup (cross-correlation
+    /// measured ~207 ms = speak-server queue + speaker buffer +
+    /// acoustic path); sweep this value to find the best for your
+    /// room. Only meaningful with `--aec-kernel webrtc`.
+    #[cfg(feature = "webrtc-aec")]
+    #[arg(long, default_value_t = 200)]
+    webrtc_stream_delay_ms: u16,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -233,13 +246,23 @@ async fn main() -> Result<()> {
             "spectral" => Box::new(SpectralSubtractionAec::new()),
             "nlms" => Box::new(NlmsAec::new()),
             #[cfg(feature = "webrtc-aec")]
-            "webrtc" => Box::new(WebrtcAec::new()?),
+            "webrtc" => Box::new(WebrtcAec::new(args.webrtc_stream_delay_ms)?),
             #[cfg(not(feature = "webrtc-aec"))]
             "webrtc" => unreachable!("webrtc-aec feature disabled"),
             // clap's value_parser already restricts the set; the
             // exhaustive match is for the type checker.
             other => unreachable!("clap allowed unexpected --aec-kernel {other}"),
         };
+        #[cfg(feature = "webrtc-aec")]
+        if args.aec_kernel == "webrtc" {
+            eprintln!(
+                "AEC kernel: webrtc (stream_delay_ms={})",
+                args.webrtc_stream_delay_ms
+            );
+        } else {
+            eprintln!("AEC kernel: {}", args.aec_kernel);
+        }
+        #[cfg(not(feature = "webrtc-aec"))]
         eprintln!("AEC kernel: {}", args.aec_kernel);
         Some(kernel)
     } else {

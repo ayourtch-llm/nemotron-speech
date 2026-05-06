@@ -56,6 +56,13 @@ struct Args {
         arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])
     )]
     kernel: String,
+    /// AEC3 stream-delay hint in milliseconds (only meaningful with
+    /// `--kernel webrtc`). See transcribe_live for context — this is
+    /// the same sweep knob, available offline so we can characterise
+    /// rooms with WAV captures before deploying.
+    #[cfg(feature = "webrtc-aec")]
+    #[arg(long, default_value_t = 200)]
+    webrtc_stream_delay_ms: u16,
 }
 
 fn main() -> Result<()> {
@@ -82,11 +89,21 @@ fn main() -> Result<()> {
         "spectral" => Box::new(SpectralSubtractionAec::new()),
         "nlms" => Box::new(NlmsAec::new()),
         #[cfg(feature = "webrtc-aec")]
-        "webrtc" => Box::new(WebrtcAec::new()?),
+        "webrtc" => Box::new(WebrtcAec::new(args.webrtc_stream_delay_ms)?),
         #[cfg(not(feature = "webrtc-aec"))]
         "webrtc" => unreachable!("webrtc-aec feature disabled"),
         other => unreachable!("clap allowed unexpected --kernel {other}"),
     };
+    #[cfg(feature = "webrtc-aec")]
+    if args.kernel == "webrtc" {
+        eprintln!(
+            "kernel: webrtc (stream_delay_ms={})",
+            args.webrtc_stream_delay_ms
+        );
+    } else {
+        eprintln!("kernel: {}", args.kernel);
+    }
+    #[cfg(not(feature = "webrtc-aec"))]
     eprintln!("kernel: {}", args.kernel);
 
     let frame = args.frame;

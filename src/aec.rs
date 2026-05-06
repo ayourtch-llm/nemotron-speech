@@ -598,27 +598,53 @@ impl AecKernel for NlmsAec {
 /// This is intentionally feature-gated and not the default kernel. It
 /// exists as a measurement baseline for the room before the pure-Rust
 /// residual suppressor lands on top of NLMS.
+///
+/// Stream-delay note: the first version of this kernel left the
+/// `EchoCanceller::Full { stream_delay_ms }` field at `None`, which
+/// puts AEC3 into blind-delay mode. The live test in Andrew's room
+/// hit only 1.5–6.2 dB ERLE that way (the library's own
+/// `echo_return_loss_enhancement` reading 0.176 dB and
+/// `delay_median_ms` returning `None` for 50+ seconds — both signs
+/// of the host failing to provide the round-trip render-to-capture
+/// hint). Setting this field unblocks the proper AEC3 fast path.
+/// Default 200 ms matches the cross-correlation-measured ~207 ms in
+/// our setup (speak-server queue + speaker buffer + acoustic path);
+/// the CLI exposes a sweep knob in transcribe_live / aec_check.
 #[cfg(feature = "webrtc-aec")]
 pub struct WebrtcAec {
     processor: Processor,
+    stream_delay_ms: u16,
     last_stats: Option<FrameStats>,
     frames_since_lock: u64,
 }
 
 #[cfg(feature = "webrtc-aec")]
 impl WebrtcAec {
-    pub fn new() -> anyhow::Result<Self> {
+    /// Construct an AEC3 processor with the given render-to-capture
+    /// round-trip hint in milliseconds. The crate forwards this to the
+    /// FFI `set_stream_delay_ms` per capture frame; we do not need to
+    /// touch the processor between frames ourselves.
+    pub fn new(stream_delay_ms: u16) -> anyhow::Result<Self> {
         let processor = Processor::new(SR).map_err(|err| anyhow::anyhow!("{err:?}"))?;
         processor.set_config(WebrtcConfig {
-            echo_canceller: Some(EchoCanceller::default()),
+            echo_canceller: Some(EchoCanceller::Full {
+                stream_delay_ms: Some(stream_delay_ms),
+            }),
             high_pass_filter: Some(Default::default()),
             ..Default::default()
         });
         Ok(Self {
             processor,
+            stream_delay_ms,
             last_stats: None,
             frames_since_lock: 0,
         })
+    }
+
+    /// The stream-delay hint this processor was constructed with.
+    /// Used for diagnostic logging at startup.
+    pub fn stream_delay_ms(&self) -> u16 {
+        self.stream_delay_ms
     }
 
     fn sample_rate_to_samples(ms: Option<u32>) -> usize {
