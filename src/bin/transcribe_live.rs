@@ -76,6 +76,14 @@ struct Args {
     /// See docs/specs/m3-5-echo-cancellation.md.
     #[arg(long)]
     reference_listen: Option<String>,
+    /// On startup, POST to this URL to ask speak-server to emit a short
+    /// calibration phrase ("Recognition ready.") through both the speaker
+    /// and the reference UDP stream. Gives the AEC kernel a clean
+    /// delay/gain lock before the noisy bidirectional flow starts.
+    /// Best-effort: failures are logged, not fatal. Only meaningful with
+    /// `--reference-listen`. Spec §3 phase A.5.
+    #[arg(long)]
+    calibrate_url: Option<String>,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -203,6 +211,24 @@ async fn main() -> Result<()> {
     let mut aec_kernel: Option<SpectralSubtractionAec> =
         ref_history.as_ref().map(|_| SpectralSubtractionAec::new());
 
+    // Optional startup calibration: ask speak-server to emit a short
+    // phrase through the speaker + reference UDP stream so the AEC
+    // kernel has a clean signal to lock onto before the user talks.
+    // Best-effort — failures here don't bring the daemon down. Only
+    // meaningful with --reference-listen; warn-and-skip otherwise.
+    match (&args.reference_listen, &args.calibrate_url) {
+        (Some(_), Some(url)) => match calibrate_post(url) {
+            Ok(()) => eprintln!("calibration POST {url} ok"),
+            Err(e) => tracing::warn!("calibration POST {url} failed: {e:#}"),
+        },
+        (None, Some(_)) => {
+            tracing::warn!(
+                "--calibrate-url has no effect without --reference-listen; skipping POST"
+            );
+        }
+        _ => {}
+    }
+
     // Optional text-mirroring sink: a UDP socket bound to an ephemeral port
     // that forwards each emitted chunk (plain text + '\n') to a target.
     let text_sink: Option<(std::net::UdpSocket, std::net::SocketAddr)> = match &args.text_out {
@@ -321,6 +347,56 @@ async fn main() -> Result<()> {
         }
     }
     eprintln!();
+    Ok(())
+}
+
+/// One-shot blocking HTTP POST with no body. Hand-rolled because (a) it's
+/// literally one request, (b) avoids pulling in an HTTP-client crate for
+/// 30 lines of work, and (c) at startup the runtime has nothing else to
+/// do, so blocking the executor for the duration is fine. Used by the
+/// `--calibrate-url` pathway to ask speak-server for a calibration phrase.
+fn calibrate_post(url: &str) -> Result<()> {
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| anyhow::anyhow!("--calibrate-url must start with http://"))?;
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let addr = host_port
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {host_port}"))?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses for {host_port}"))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .with_context(|| format!("connecting to {addr}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).context("writing POST")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .context("reading status line")?;
+    let trimmed = status_line.trim_end();
+    let code: u16 = trimmed
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&code) {
+        anyhow::bail!("HTTP {code}: {trimmed}");
+    }
     Ok(())
 }
 
