@@ -296,9 +296,11 @@ async fn main() -> Result<()> {
                 // AEC diagnostics. Aggregate frame stats; once per ~1 s
                 // of mic input, emit a single INFO line summarising the
                 // kernel's behaviour in this window.
-                if let (Some(logger), Some(kernel), Some(hist)) =
-                    (aec_logger.as_mut(), aec_kernel.as_ref(), ref_history.as_ref())
-                {
+                if let (Some(logger), Some(kernel), Some(hist)) = (
+                    aec_logger.as_mut(),
+                    aec_kernel.as_ref(),
+                    ref_history.as_ref(),
+                ) {
                     let stats = kernel.last_frame_stats().copied();
                     if logger.observe(chunk.samples.len(), stats.as_ref()) {
                         let (rb_len, rb_cap) = match hist.lock() {
@@ -431,12 +433,7 @@ impl AecLogger {
         self.samples_in_window >= self.samples_per_log
     }
 
-    fn flush(
-        &mut self,
-        kernel: &SpectralSubtractionAec,
-        ref_buf_len: usize,
-        ref_buf_cap: usize,
-    ) {
+    fn flush(&mut self, kernel: &SpectralSubtractionAec, ref_buf_len: usize, ref_buf_cap: usize) {
         self.log_seq += 1;
         let delay_ms = kernel.delay_estimate() / 16.0;
         let frames_since_lock = kernel.frames_since_lock();
@@ -447,9 +444,7 @@ impl AecLogger {
         };
         if self.active_frames > 0 {
             let erle_db = 10.0
-                * (self.sum_mic_frame_energy
-                    / self.sum_cleaned_frame_energy.max(1e-12))
-                .log10();
+                * (self.sum_mic_frame_energy / self.sum_cleaned_frame_energy.max(1e-12)).log10();
             let avg_conf = self.sum_confidence / self.active_frames as f32;
             let avg_gain = self.sum_gain / self.active_frames as f32;
             tracing::info!(
