@@ -20,6 +20,8 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
+#[cfg(feature = "webrtc-aec")]
+use nemotron_speech::aec::WebrtcAec;
 use nemotron_speech::aec::{
     AecKernel, FrameStats, NlmsAec, ReferenceHistory, SpectralSubtractionAec,
 };
@@ -93,7 +95,14 @@ struct Args {
     /// real rooms because multipath echo doesn't correlate strongly at
     /// any single delay. Use `spectral` only as a fallback if NLMS
     /// misbehaves.
-    #[arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])]
+    #[cfg_attr(
+        feature = "webrtc-aec",
+        arg(long, default_value = "nlms", value_parser = ["nlms", "spectral", "webrtc"])
+    )]
+    #[cfg_attr(
+        not(feature = "webrtc-aec"),
+        arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])
+    )]
     aec_kernel: String,
     #[arg(long, default_value_t = false)]
     cpu: bool,
@@ -219,17 +228,23 @@ async fn main() -> Result<()> {
             Some(history)
         }
     };
-    let mut aec_kernel: Option<Box<dyn AecKernel>> = ref_history.as_ref().map(|_| {
+    let mut aec_kernel: Option<Box<dyn AecKernel>> = if ref_history.is_some() {
         let kernel: Box<dyn AecKernel> = match args.aec_kernel.as_str() {
             "spectral" => Box::new(SpectralSubtractionAec::new()),
             "nlms" => Box::new(NlmsAec::new()),
+            #[cfg(feature = "webrtc-aec")]
+            "webrtc" => Box::new(WebrtcAec::new()?),
+            #[cfg(not(feature = "webrtc-aec"))]
+            "webrtc" => unreachable!("webrtc-aec feature disabled"),
             // clap's value_parser already restricts the set; the
             // exhaustive match is for the type checker.
             other => unreachable!("clap allowed unexpected --aec-kernel {other}"),
         };
         eprintln!("AEC kernel: {}", args.aec_kernel);
-        kernel
-    });
+        Some(kernel)
+    } else {
+        None
+    };
 
     // Per-second AEC stats logger. Tracks aggregate ERLE / confidence /
     // gain over each ~16k-sample mic window and emits one tracing::info

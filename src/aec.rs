@@ -22,6 +22,13 @@
 
 use std::collections::VecDeque;
 
+#[cfg(feature = "webrtc-aec")]
+use webrtc_audio_processing::Config as WebrtcConfig;
+#[cfg(feature = "webrtc-aec")]
+use webrtc_audio_processing::Processor;
+#[cfg(feature = "webrtc-aec")]
+use webrtc_audio_processing_config::EchoCanceller;
+
 /// Sample rate everything in this module assumes (matches mic + reference).
 pub const SR: u32 = 16_000;
 
@@ -583,6 +590,133 @@ impl AecKernel for NlmsAec {
 
     fn frames_since_lock(&self) -> u64 {
         self.frames_since_update
+    }
+}
+
+/// AEC3 baseline through `webrtc-audio-processing`.
+///
+/// This is intentionally feature-gated and not the default kernel. It
+/// exists as a measurement baseline for the room before the pure-Rust
+/// residual suppressor lands on top of NLMS.
+#[cfg(feature = "webrtc-aec")]
+pub struct WebrtcAec {
+    processor: Processor,
+    last_stats: Option<FrameStats>,
+    frames_since_lock: u64,
+}
+
+#[cfg(feature = "webrtc-aec")]
+impl WebrtcAec {
+    pub fn new() -> anyhow::Result<Self> {
+        let processor = Processor::new(SR).map_err(|err| anyhow::anyhow!("{err:?}"))?;
+        processor.set_config(WebrtcConfig {
+            echo_canceller: Some(EchoCanceller::default()),
+            high_pass_filter: Some(Default::default()),
+            ..Default::default()
+        });
+        Ok(Self {
+            processor,
+            last_stats: None,
+            frames_since_lock: 0,
+        })
+    }
+
+    fn sample_rate_to_samples(ms: Option<u32>) -> usize {
+        ms.unwrap_or(0).max(0) as usize * SR as usize / 1_000
+    }
+}
+
+#[cfg(feature = "webrtc-aec")]
+impl AecKernel for WebrtcAec {
+    fn process(&mut self, mic_frame: &[f32], ref_history: &[f32]) -> Vec<f32> {
+        let frame_len = self.processor.num_samples_per_frame();
+        if mic_frame.is_empty() || frame_len == 0 || mic_frame.len() < frame_len {
+            self.last_stats = None;
+            return mic_frame.to_vec();
+        }
+
+        let n_blocks = mic_frame.len() / frame_len;
+        if n_blocks == 0 {
+            self.last_stats = None;
+            return mic_frame.to_vec();
+        }
+        let required_ref = n_blocks * frame_len;
+        if ref_history.len() < required_ref {
+            self.last_stats = None;
+            self.frames_since_lock = self.frames_since_lock.saturating_add(1);
+            return mic_frame.to_vec();
+        }
+
+        let ref_tail = &ref_history[ref_history.len() - required_ref..];
+        let mut out = Vec::with_capacity(n_blocks * frame_len);
+        let mut last_stats = None;
+
+        for block_idx in 0..n_blocks {
+            let start = block_idx * frame_len;
+            let end = start + frame_len;
+
+            let mut render_frame = vec![ref_tail[start..end].to_vec()];
+            if self
+                .processor
+                .process_render_frame(&mut render_frame)
+                .is_err()
+            {
+                self.last_stats = None;
+                return mic_frame.to_vec();
+            }
+
+            let mut capture_frame = vec![mic_frame[start..end].to_vec()];
+            if self
+                .processor
+                .process_capture_frame(&mut capture_frame)
+                .is_err()
+            {
+                self.last_stats = None;
+                return mic_frame.to_vec();
+            }
+
+            let processed = capture_frame.pop().unwrap_or_default();
+            let mic_energy = dot(&mic_frame[start..end], &mic_frame[start..end]);
+            let cleaned_frame_energy = dot(&processed, &processed);
+            let ref_energy = dot(&ref_tail[start..end], &ref_tail[start..end]);
+            let stats = self.processor.get_stats();
+            last_stats = Some(FrameStats {
+                best_d: Self::sample_rate_to_samples(stats.delay_median_ms),
+                confidence: stats
+                    .voice_detected
+                    .map(|v| if v { 1.0 } else { 0.0 })
+                    .unwrap_or(0.0),
+                gain: stats.echo_return_loss_enhancement.unwrap_or(0.0) as f32,
+                mic_energy,
+                ref_energy,
+                mic_frame_energy: mic_energy,
+                cleaned_frame_energy,
+            });
+            self.frames_since_lock = if stats.delay_median_ms.is_some() {
+                0
+            } else {
+                self.frames_since_lock.saturating_add(1)
+            };
+            out.extend_from_slice(&processed);
+        }
+
+        self.last_stats = last_stats;
+        out
+    }
+
+    fn last_frame_stats(&self) -> Option<&FrameStats> {
+        self.last_stats.as_ref()
+    }
+
+    fn delay_estimate(&self) -> f32 {
+        self.last_stats
+            .as_ref()
+            .map(|stats| stats.best_d as f32)
+            .unwrap_or(0.0)
+    }
+
+    fn frames_since_lock(&self) -> u64 {
+        self.frames_since_lock
     }
 }
 

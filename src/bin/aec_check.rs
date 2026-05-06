@@ -16,6 +16,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+#[cfg(feature = "webrtc-aec")]
+use nemotron_speech::aec::WebrtcAec;
 use nemotron_speech::aec::{AecKernel, NlmsAec, ReferenceHistory, SpectralSubtractionAec};
 use nemotron_speech::audio::load_audio_mono_16k;
 use std::path::PathBuf;
@@ -41,9 +43,18 @@ struct Args {
     /// Print per-frame AEC stats (delay, confidence, gain).
     #[arg(long, default_value_t = false)]
     verbose: bool,
-    /// AEC kernel: `nlms` (default, multi-tap adaptive FIR) or `spectral`
-    /// (phase A single-tap cross-correlation, kept as fallback).
-    #[arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])]
+    /// AEC kernel: `nlms` (default, multi-tap adaptive FIR), `spectral`
+    /// (phase A single-tap cross-correlation, fallback), or `webrtc`
+    /// (only when built with `--features webrtc-aec`; AEC3 baseline
+    /// from `webrtc-audio-processing`).
+    #[cfg_attr(
+        feature = "webrtc-aec",
+        arg(long, default_value = "nlms", value_parser = ["nlms", "spectral", "webrtc"])
+    )]
+    #[cfg_attr(
+        not(feature = "webrtc-aec"),
+        arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])
+    )]
     kernel: String,
 }
 
@@ -70,6 +81,10 @@ fn main() -> Result<()> {
     let mut kernel: Box<dyn AecKernel> = match args.kernel.as_str() {
         "spectral" => Box::new(SpectralSubtractionAec::new()),
         "nlms" => Box::new(NlmsAec::new()),
+        #[cfg(feature = "webrtc-aec")]
+        "webrtc" => Box::new(WebrtcAec::new()?),
+        #[cfg(not(feature = "webrtc-aec"))]
+        "webrtc" => unreachable!("webrtc-aec feature disabled"),
         other => unreachable!("clap allowed unexpected --kernel {other}"),
     };
     eprintln!("kernel: {}", args.kernel);

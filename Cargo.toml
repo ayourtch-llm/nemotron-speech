@@ -22,6 +22,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 half = "2"
+webrtc-audio-processing = { version = "~2.0", optional = true }
+webrtc-audio-processing-config = { version = "~2.0", optional = true }
 
 [features]
 default = ["cpu"]
@@ -29,6 +31,11 @@ cpu = []
 metal = ["candle-core/metal", "candle-nn/metal"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 mic = ["dep:cpal"]
+webrtc-aec = [
+    "dep:webrtc-audio-processing",
+    "dep:webrtc-audio-processing-config",
+    "webrtc-audio-processing/bundled",
+]
 
 [dependencies.cpal]
 version = "0.15"
