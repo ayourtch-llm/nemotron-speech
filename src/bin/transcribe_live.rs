@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
+use nemotron_speech::aec::{AecKernel, ReferenceHistory, SpectralSubtractionAec};
 use nemotron_speech::audio::load_audio_mono_16k;
 use nemotron_speech::audio_source::{AudioSource, FileChunkSource, UdpSource};
 #[cfg(feature = "mic")]
@@ -33,6 +34,7 @@ use nemotron_speech::streaming::StreamingPipeline;
 use nemotron_speech::tokenizer::Tokenizer;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -68,6 +70,12 @@ struct Args {
     /// at the cost of more fragmentation.
     #[arg(long, default_value_t = 1500)]
     idle_flush_ms: u64,
+    /// Bind a UDP socket for the TTS reference signal (raw f32-LE 16 kHz mono
+    /// PCM, same wire format as `--udp-listen`). When set, AEC subtracts the
+    /// speaker's audio from the mic before transcription. Defaults to off.
+    /// See docs/specs/m3-5-echo-cancellation.md.
+    #[arg(long)]
+    reference_listen: Option<String>,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -136,6 +144,61 @@ async fn main() -> Result<()> {
         anyhow::bail!("specify --audio <file>, --mic, or --udp-listen <addr>");
     };
 
+    // Optional AEC: bind a second UDP socket for the TTS reference stream
+    // and run echo cancellation on each mic chunk before it hits the
+    // pipeline. The listener task pushes samples into a shared ring buffer;
+    // the main loop snapshots the buffer per chunk and runs the kernel.
+    // Without --reference-listen, both sides are None and the loop is
+    // bit-identical to before this milestone.
+    let ref_history: Option<Arc<Mutex<ReferenceHistory>>> = match &args.reference_listen {
+        None => None,
+        Some(addr) => {
+            // 3 s of history is plenty for any realistic acoustic delay.
+            let history = Arc::new(Mutex::new(ReferenceHistory::new(48_000)));
+            let socket = tokio::net::UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("binding --reference-listen {addr}"))?;
+            eprintln!("reference UDP listening on {}", socket.local_addr()?);
+            let h = history.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65_536];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((n, _peer)) => {
+                            if n % 4 != 0 {
+                                tracing::warn!(
+                                    "reference UDP datagram of {n} bytes \
+                                     (not a multiple of 4 — expected raw f32 LE)"
+                                );
+                                continue;
+                            }
+                            let mut samples = Vec::with_capacity(n / 4);
+                            for i in 0..n / 4 {
+                                let off = i * 4;
+                                samples.push(f32::from_le_bytes([
+                                    buf[off],
+                                    buf[off + 1],
+                                    buf[off + 2],
+                                    buf[off + 3],
+                                ]));
+                            }
+                            if let Ok(mut h) = h.lock() {
+                                h.push(&samples);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("reference UDP recv error: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+            Some(history)
+        }
+    };
+    let mut aec_kernel: Option<SpectralSubtractionAec> =
+        ref_history.as_ref().map(|_| SpectralSubtractionAec::new());
+
     // Optional text-mirroring sink: a UDP socket bound to an ephemeral port
     // that forwards each emitted chunk (plain text + '\n') to a target.
     let text_sink: Option<(std::net::UdpSocket, std::net::SocketAddr)> = match &args.text_out {
@@ -174,7 +237,23 @@ async fn main() -> Result<()> {
             None => break,
             Some(chunk) => {
                 let is_final = chunk.is_final;
-                pipe.push_audio(&chunk.samples);
+                // AEC: if a reference stream is wired up, snapshot the
+                // ring buffer (cheap memcpy, ~50 KB) and run the kernel.
+                // The snapshot avoids holding the lock across the kernel.
+                let cleaned: Option<Vec<f32>> =
+                    match (&ref_history, aec_kernel.as_mut()) {
+                        (Some(hist), Some(kernel)) => {
+                            let snap = match hist.lock() {
+                                Ok(h) => h.snapshot(),
+                                Err(_) => Vec::new(),
+                            };
+                            Some(kernel.process(&chunk.samples, &snap))
+                        }
+                        _ => None,
+                    };
+                let samples_for_pipe: &[f32] =
+                    cleaned.as_deref().unwrap_or(&chunk.samples);
+                pipe.push_audio(samples_for_pipe);
                 if is_final {
                     pipe.finish();
                 }
