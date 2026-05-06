@@ -89,6 +89,11 @@ pub struct SpectralSubtractionAec {
     /// True after the first confident measurement; gates the narrow
     /// search behavior.
     locked: bool,
+    /// Frames processed since the last confident lock-in update.
+    /// Increments every `process()` call; resets to 0 when a confident
+    /// measurement updates the EMA. Useful for diagnostics: a growing
+    /// count means the kernel is coasting on its last good lock.
+    frames_since_lock: u64,
     last_stats: Option<FrameStats>,
 }
 
@@ -126,6 +131,7 @@ impl SpectralSubtractionAec {
             // that a transient frame can't pick a wildly wrong peak.
             lock_radius: 100,
             locked: false,
+            frames_since_lock: 0,
             last_stats: None,
         }
     }
@@ -145,10 +151,18 @@ impl SpectralSubtractionAec {
         self.delay_estimate
     }
 
-    /// Per-frame stats from the most recent `process()` call. For
-    /// diagnostics / verbose mode in `aec_check`.
+    /// Per-frame stats from the most recent `process()` call. `None` if
+    /// the last call was a pass-through (insufficient history or silent
+    /// reference) — i.e. the kernel didn't actually engage.
     pub fn last_frame_stats(&self) -> Option<&FrameStats> {
         self.last_stats.as_ref()
+    }
+
+    /// Frames processed since the last confident delay lock-in. Resets
+    /// to 0 whenever a frame with `confidence >= confidence_threshold`
+    /// updates the EMA. Useful as a "freshness" signal in diagnostics.
+    pub fn frames_since_lock(&self) -> u64 {
+        self.frames_since_lock
     }
 }
 
@@ -157,8 +171,14 @@ pub struct FrameStats {
     pub best_d: usize,
     pub confidence: f32,
     pub gain: f32,
+    /// Energy of the long mic-history window (search_window samples).
     pub mic_energy: f32,
+    /// Energy of the long reference window at the current delay estimate.
     pub ref_energy: f32,
+    /// Energy of *just this frame's* mic input — needed for ERLE.
+    pub mic_frame_energy: f32,
+    /// Energy of *just this frame's* cleaned output — needed for ERLE.
+    pub cleaned_frame_energy: f32,
 }
 
 impl AecKernel for SpectralSubtractionAec {
@@ -168,6 +188,10 @@ impl AecKernel for SpectralSubtractionAec {
             return Vec::new();
         }
         let w = self.search_window;
+
+        // Diagnostics counter — increments every call, resets only on a
+        // confident lock-in below.
+        self.frames_since_lock = self.frames_since_lock.saturating_add(1);
 
         // Update the internal mic-history buffer.
         for &s in mic_frame {
@@ -180,6 +204,9 @@ impl AecKernel for SpectralSubtractionAec {
         // Need enough history on both sides to align the long window at
         // every candidate delay.
         if self.mic_history.len() < w || ref_history.len() < w + self.search_max {
+            // Pass-through — clear any stale stats from prior frames so
+            // callers don't read forward-leaked numbers.
+            self.last_stats = None;
             return mic_frame.to_vec();
         }
 
@@ -200,6 +227,7 @@ impl AecKernel for SpectralSubtractionAec {
         let probe_ref_energy = dot(probe_ref, probe_ref);
         let probe_ref_rms = (probe_ref_energy / w as f32).sqrt();
         if probe_ref_rms < self.ref_silence_rms {
+            self.last_stats = None;
             return mic_frame.to_vec();
         }
 
@@ -274,6 +302,7 @@ impl AecKernel for SpectralSubtractionAec {
                     + self.delay_alpha * best_d as f32;
             }
             self.locked = true;
+            self.frames_since_lock = 0;
             best_d
         } else {
             self.delay_estimate
@@ -289,14 +318,6 @@ impl AecKernel for SpectralSubtractionAec {
         let cross = dot(&mic_buf, ref_long);
         let gain = (cross / ref_energy.max(1e-9)).clamp(-self.gain_clip, self.gain_clip);
 
-        self.last_stats = Some(FrameStats {
-            best_d,
-            confidence,
-            gain,
-            mic_energy,
-            ref_energy: probe_ref_energy,
-        });
-
         // Subtract from the current frame using the aligned ref window
         // for that frame (the last `n` samples of the long window).
         let frame_end = ref_history.len() - d_use;
@@ -306,6 +327,22 @@ impl AecKernel for SpectralSubtractionAec {
         for i in 0..n {
             out.push(mic_frame[i] - gain * ref_aligned_frame[i]);
         }
+
+        // Frame-level energies for ERLE. Aggregating these (sum-of-energy,
+        // not avg-of-dB) over a window gives a meaningful suppression
+        // number even when individual frames are noisy.
+        let mic_frame_energy = dot(mic_frame, mic_frame);
+        let cleaned_frame_energy = dot(&out, &out);
+        self.last_stats = Some(FrameStats {
+            best_d,
+            confidence,
+            gain,
+            mic_energy,
+            ref_energy: probe_ref_energy,
+            mic_frame_energy,
+            cleaned_frame_energy,
+        });
+
         out
     }
 }

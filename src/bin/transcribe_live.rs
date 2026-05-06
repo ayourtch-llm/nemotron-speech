@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
-use nemotron_speech::aec::{AecKernel, ReferenceHistory, SpectralSubtractionAec};
+use nemotron_speech::aec::{AecKernel, FrameStats, ReferenceHistory, SpectralSubtractionAec};
 use nemotron_speech::audio::load_audio_mono_16k;
 #[cfg(feature = "mic")]
 use nemotron_speech::audio_source::mic::MicSource;
@@ -211,6 +211,13 @@ async fn main() -> Result<()> {
     let mut aec_kernel: Option<SpectralSubtractionAec> =
         ref_history.as_ref().map(|_| SpectralSubtractionAec::new());
 
+    // Per-second AEC stats logger. Tracks aggregate ERLE / confidence /
+    // gain over each ~16k-sample mic window and emits one tracing::info
+    // line per second so the live operator can see actual suppression
+    // numbers instead of guessing. Only present when --reference-listen
+    // is set, so non-AEC runs stay quiet.
+    let mut aec_logger: Option<AecLogger> = ref_history.as_ref().map(|_| AecLogger::new(SR_HZ));
+
     // Optional startup calibration: ask speak-server to emit a short
     // phrase through the speaker + reference UDP stream so the AEC
     // kernel has a clean signal to lock onto before the user talks.
@@ -285,6 +292,22 @@ async fn main() -> Result<()> {
                 if is_final {
                     pipe.finish();
                 }
+
+                // AEC diagnostics. Aggregate frame stats; once per ~1 s
+                // of mic input, emit a single INFO line summarising the
+                // kernel's behaviour in this window.
+                if let (Some(logger), Some(kernel), Some(hist)) =
+                    (aec_logger.as_mut(), aec_kernel.as_ref(), ref_history.as_ref())
+                {
+                    let stats = kernel.last_frame_stats().copied();
+                    if logger.observe(chunk.samples.len(), stats.as_ref()) {
+                        let (rb_len, rb_cap) = match hist.lock() {
+                            Ok(h) => (h.len(), h.capacity()),
+                            Err(_) => (0, 0),
+                        };
+                        logger.flush(kernel, rb_len, rb_cap);
+                    }
+                }
                 let prev_total = pipe.all_tokens.len();
                 while let Some(_) = pipe.try_advance()? {}
                 let n = pipe.all_tokens.len();
@@ -348,6 +371,126 @@ async fn main() -> Result<()> {
     }
     eprintln!();
     Ok(())
+}
+
+/// Mic sample rate the AEC pipeline assumes. Mirrors `aec::SR` but
+/// kept local so the logger doesn't need a candle dep.
+const SR_HZ: usize = 16_000;
+
+/// Aggregator for per-second AEC stats. Sums frame energies over a
+/// window of mic samples; once the window crosses one second, emits a
+/// single tracing::info line and resets. ERLE is computed from the
+/// summed energies (not averaged dB) so silent frames don't bias the
+/// reading.
+struct AecLogger {
+    /// Mic samples accumulated since the last flush. We log when this
+    /// crosses `samples_per_log`.
+    samples_in_window: usize,
+    samples_per_log: usize,
+    /// Aggregated frame energies — only over frames where the kernel
+    /// engaged (ref above silence floor). ERLE = 10·log10(mic/cleaned).
+    sum_mic_frame_energy: f32,
+    sum_cleaned_frame_energy: f32,
+    /// Aggregated soft signals — averaged across active frames.
+    sum_confidence: f32,
+    sum_gain: f32,
+    /// Counts.
+    active_frames: u32,
+    total_frames: u32,
+    log_seq: u64,
+}
+
+impl AecLogger {
+    fn new(sample_rate: usize) -> Self {
+        Self {
+            samples_in_window: 0,
+            samples_per_log: sample_rate,
+            sum_mic_frame_energy: 0.0,
+            sum_cleaned_frame_energy: 0.0,
+            sum_confidence: 0.0,
+            sum_gain: 0.0,
+            active_frames: 0,
+            total_frames: 0,
+            log_seq: 0,
+        }
+    }
+
+    /// Record a frame's stats. Returns true once the accumulated mic
+    /// time crosses `samples_per_log` — the caller should then call
+    /// `flush()`.
+    fn observe(&mut self, mic_samples: usize, stats: Option<&FrameStats>) -> bool {
+        self.samples_in_window += mic_samples;
+        self.total_frames += 1;
+        if let Some(s) = stats {
+            self.sum_mic_frame_energy += s.mic_frame_energy;
+            self.sum_cleaned_frame_energy += s.cleaned_frame_energy;
+            self.sum_confidence += s.confidence;
+            self.sum_gain += s.gain;
+            self.active_frames += 1;
+        }
+        self.samples_in_window >= self.samples_per_log
+    }
+
+    fn flush(
+        &mut self,
+        kernel: &SpectralSubtractionAec,
+        ref_buf_len: usize,
+        ref_buf_cap: usize,
+    ) {
+        self.log_seq += 1;
+        let delay_ms = kernel.delay_estimate() / 16.0;
+        let frames_since_lock = kernel.frames_since_lock();
+        let buf_pct = if ref_buf_cap > 0 {
+            100.0 * ref_buf_len as f32 / ref_buf_cap as f32
+        } else {
+            0.0
+        };
+        if self.active_frames > 0 {
+            let erle_db = 10.0
+                * (self.sum_mic_frame_energy
+                    / self.sum_cleaned_frame_energy.max(1e-12))
+                .log10();
+            let avg_conf = self.sum_confidence / self.active_frames as f32;
+            let avg_gain = self.sum_gain / self.active_frames as f32;
+            tracing::info!(
+                "aec t={}s ref_buf={}/{} ({:.0}%) active={}/{} delay={:.1}ms gain={:+.3} conf={:.2} ERLE={:+.1}dB since_lock={}",
+                self.log_seq,
+                ref_buf_len,
+                ref_buf_cap,
+                buf_pct,
+                self.active_frames,
+                self.total_frames,
+                delay_ms,
+                avg_gain,
+                avg_conf,
+                erle_db,
+                frames_since_lock,
+            );
+        } else {
+            // ref was below the silence floor (or insufficient history)
+            // for the whole window — ERLE is meaningless, mic was passed
+            // through unchanged. Useful in itself: tells the operator
+            // the daemon isn't seeing reference audio yet.
+            tracing::info!(
+                "aec t={}s ref_buf={}/{} ({:.0}%) ref=silent active=0/{} delay={:.1}ms since_lock={}",
+                self.log_seq,
+                ref_buf_len,
+                ref_buf_cap,
+                buf_pct,
+                self.total_frames,
+                delay_ms,
+                frames_since_lock,
+            );
+        }
+        // Reset window; counters carry forward via log_seq only.
+        self.samples_in_window = 0;
+        self.sum_mic_frame_energy = 0.0;
+        self.sum_cleaned_frame_energy = 0.0;
+        self.sum_confidence = 0.0;
+        self.sum_gain = 0.0;
+        self.active_frames = 0;
+        self.total_frames = 0;
+    }
 }
 
 /// One-shot blocking HTTP POST with no body. Hand-rolled because (a) it's
