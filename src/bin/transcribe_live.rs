@@ -20,7 +20,9 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
-use nemotron_speech::aec::{AecKernel, FrameStats, ReferenceHistory, SpectralSubtractionAec};
+use nemotron_speech::aec::{
+    AecKernel, FrameStats, NlmsAec, ReferenceHistory, SpectralSubtractionAec,
+};
 use nemotron_speech::audio::load_audio_mono_16k;
 #[cfg(feature = "mic")]
 use nemotron_speech::audio_source::mic::MicSource;
@@ -84,6 +86,15 @@ struct Args {
     /// `--reference-listen`. Spec §3 phase A.5.
     #[arg(long)]
     calibrate_url: Option<String>,
+    /// AEC algorithm. `nlms` is a 4096-tap normalised-LMS adaptive FIR
+    /// modelling the room impulse response; `spectral` is the original
+    /// single-tap cross-correlation kernel from phase A. NLMS is
+    /// default — phase A's single-tap model produced ~0 dB ERLE in
+    /// real rooms because multipath echo doesn't correlate strongly at
+    /// any single delay. Use `spectral` only as a fallback if NLMS
+    /// misbehaves.
+    #[arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])]
+    aec_kernel: String,
     #[arg(long, default_value_t = false)]
     cpu: bool,
 }
@@ -208,8 +219,17 @@ async fn main() -> Result<()> {
             Some(history)
         }
     };
-    let mut aec_kernel: Option<SpectralSubtractionAec> =
-        ref_history.as_ref().map(|_| SpectralSubtractionAec::new());
+    let mut aec_kernel: Option<Box<dyn AecKernel>> = ref_history.as_ref().map(|_| {
+        let kernel: Box<dyn AecKernel> = match args.aec_kernel.as_str() {
+            "spectral" => Box::new(SpectralSubtractionAec::new()),
+            "nlms" => Box::new(NlmsAec::new()),
+            // clap's value_parser already restricts the set; the
+            // exhaustive match is for the type checker.
+            other => unreachable!("clap allowed unexpected --aec-kernel {other}"),
+        };
+        eprintln!("AEC kernel: {}", args.aec_kernel);
+        kernel
+    });
 
     // Per-second AEC stats logger. Tracks aggregate ERLE / confidence /
     // gain over each ~16k-sample mic window and emits one tracing::info
@@ -307,7 +327,7 @@ async fn main() -> Result<()> {
                             Ok(h) => (h.len(), h.capacity()),
                             Err(_) => (0, 0),
                         };
-                        logger.flush(kernel, rb_len, rb_cap);
+                        logger.flush(kernel.as_ref(), rb_len, rb_cap);
                     }
                 }
                 let prev_total = pipe.all_tokens.len();
@@ -433,7 +453,7 @@ impl AecLogger {
         self.samples_in_window >= self.samples_per_log
     }
 
-    fn flush(&mut self, kernel: &SpectralSubtractionAec, ref_buf_len: usize, ref_buf_cap: usize) {
+    fn flush(&mut self, kernel: &dyn AecKernel, ref_buf_len: usize, ref_buf_cap: usize) {
         self.log_seq += 1;
         let delay_ms = kernel.delay_estimate() / 16.0;
         let frames_since_lock = kernel.frames_since_lock();

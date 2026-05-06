@@ -27,13 +27,42 @@ pub const SR: u32 = 16_000;
 
 /// Trait for an echo-cancellation algorithm. Implementations are stateful
 /// across frames (e.g. they smooth a delay estimate or carry filter taps).
+///
+/// The diagnostic methods below back the per-second AEC log in
+/// `transcribe_live`. Each kernel is free to interpret the fields how it
+/// likes — `delay_estimate` is the bulk delay in samples for
+/// `SpectralSubtractionAec`, the peak-tap index for `NlmsAec`, etc. The
+/// only invariant is that `last_frame_stats` is `None` when the kernel
+/// passed mic through unchanged (silent reference, insufficient history,
+/// or kernel-specific freeze).
 pub trait AecKernel: Send {
     /// Process one mic frame against the most recent reference samples.
-    /// `ref_history` is oldest-first; the kernel searches for the
-    /// propagation delay inside it. Returns cleaned samples of the same
-    /// length as `mic_frame`. If the reference is silent, or there isn't
-    /// enough history yet, returns the mic frame unchanged.
+    /// `ref_history` is oldest-first; the kernel handles its own
+    /// alignment / adaptation. Returns cleaned samples of the same
+    /// length as `mic_frame`. On silent reference or insufficient
+    /// history, must return `mic_frame.to_vec()` and set
+    /// `last_frame_stats` to `None`.
     fn process(&mut self, mic_frame: &[f32], ref_history: &[f32]) -> Vec<f32>;
+
+    /// Stats from the most recent `process()` call, or `None` if the
+    /// last call was a pass-through (no useful AEC work to report).
+    fn last_frame_stats(&self) -> Option<&FrameStats> {
+        None
+    }
+
+    /// A kernel-specific "where is the echo" measure. For
+    /// `SpectralSubtractionAec` this is the smoothed bulk delay in
+    /// samples; for `NlmsAec` it's the peak filter-tap index.
+    fn delay_estimate(&self) -> f32 {
+        0.0
+    }
+
+    /// Frames since the kernel last did a meaningful state update —
+    /// confident lock-in for `SpectralSubtractionAec`, last
+    /// non-frozen adaptation step for `NlmsAec`.
+    fn frames_since_lock(&self) -> u64 {
+        0
+    }
 }
 
 /// v1 AEC: time-domain cross-correlation alignment + least-squares scalar
@@ -145,25 +174,6 @@ impl SpectralSubtractionAec {
         self
     }
 
-    /// Current smoothed delay estimate (samples back from end of history).
-    /// For diagnostics / logging.
-    pub fn delay_estimate(&self) -> f32 {
-        self.delay_estimate
-    }
-
-    /// Per-frame stats from the most recent `process()` call. `None` if
-    /// the last call was a pass-through (insufficient history or silent
-    /// reference) — i.e. the kernel didn't actually engage.
-    pub fn last_frame_stats(&self) -> Option<&FrameStats> {
-        self.last_stats.as_ref()
-    }
-
-    /// Frames processed since the last confident delay lock-in. Resets
-    /// to 0 whenever a frame with `confidence >= confidence_threshold`
-    /// updates the EMA. Useful as a "freshness" signal in diagnostics.
-    pub fn frames_since_lock(&self) -> u64 {
-        self.frames_since_lock
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,6 +354,236 @@ impl AecKernel for SpectralSubtractionAec {
         });
 
         out
+    }
+
+    fn last_frame_stats(&self) -> Option<&FrameStats> {
+        self.last_stats.as_ref()
+    }
+
+    fn delay_estimate(&self) -> f32 {
+        self.delay_estimate
+    }
+
+    fn frames_since_lock(&self) -> u64 {
+        self.frames_since_lock
+    }
+}
+
+/// Phase B AEC: normalised LMS adaptive FIR. Models the
+/// speaker→air→mic impulse response as a vector of `n_taps` filter
+/// coefficients `w[k]` and adapts per sample to minimise the residual
+/// `e[n] = mic[n] − sum_k w[k] · ref[n−k]`. Replaces
+/// `SpectralSubtractionAec` for real-room use: the single-tap LSQ
+/// model can't follow multipath echo (Andrew's M3.5 live test showed
+/// 0 dB ERLE in his actual room, with cosine similarity stuck at 0.04
+/// — no single delay correlates strongly enough), but a multi-tap FIR
+/// just sums the contributions of every reflection.
+///
+/// Sizing: 4096 taps at 16 kHz = 256 ms. Long enough to cover bulk
+/// playback latency + room impulse response (Andrew's calibration
+/// peaked at 207 ms; typical RT60 is well under 100 ms in non-reverb
+/// spaces). Per-sample cost is dominated by three N-length passes
+/// (echo prediction, ‖x‖², coefficient update) ≈ 200 MFLOPs/s — fits
+/// CPU comfortably.
+///
+/// Double-talk handling: a Geigel-style heuristic — if the frame's
+/// mic RMS exceeds `double_talk_ratio` × ref RMS, freeze the filter
+/// for that frame. The sum-of-squares for echo only is bounded by
+/// ‖h‖₂ · ref RMS ≤ ref RMS for any physical (passive) room, so a
+/// sustained excess clearly signals user speech mixed in. Updating
+/// during double-talk is the classic NLMS divergence mode (filter
+/// tries to subtract the user too, ends up amplifying noise) — the
+/// kind of failure Andrew explicitly called out.
+pub struct NlmsAec {
+    /// Filter coefficients. Stored newest-first: `w[0]` is applied to
+    /// the most recent reference sample, `w[k]` to ref n−k.
+    w: Vec<f32>,
+    /// Filter length. Default 4096 samples (~256 ms at 16 kHz).
+    n_taps: usize,
+    /// NLMS step size. 0 < mu < 2 is the textbook stability range;
+    /// 0.5 is a moderate default that converges in a few hundred ms
+    /// of speech without obvious overshoot.
+    mu: f32,
+    /// Numerical floor for the ‖x‖² normalisation — keeps the update
+    /// from blowing up when the reference momentarily dips to silence
+    /// inside an active stretch.
+    delta: f32,
+    /// Mic-RMS / ref-RMS ratio above which we freeze adaptation for
+    /// the current frame. 1.2 = 20% headroom over ref-only level.
+    double_talk_ratio: f32,
+    /// Below this RMS the reference is treated as silent — pass-through.
+    /// Matches `SpectralSubtractionAec`'s threshold so the diagnostic
+    /// log "ref=silent" semantics carry over.
+    ref_silence_rms: f32,
+    /// Frames since the last frame in which we actually updated the
+    /// filter (i.e. ref active and not in double-talk). Mirrors
+    /// `SpectralSubtractionAec::frames_since_lock` for the diagnostic
+    /// line — large values mean the filter is coasting.
+    frames_since_update: u64,
+    last_stats: Option<FrameStats>,
+}
+
+impl Default for NlmsAec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NlmsAec {
+    pub fn new() -> Self {
+        Self::with_taps(4096)
+    }
+
+    pub fn with_taps(n_taps: usize) -> Self {
+        assert!(n_taps > 0);
+        Self {
+            w: vec![0.0; n_taps],
+            n_taps,
+            mu: 0.5,
+            delta: 1e-6,
+            double_talk_ratio: 1.2,
+            ref_silence_rms: 1e-3,
+            frames_since_update: 0,
+            last_stats: None,
+        }
+    }
+
+    /// Set the NLMS step size. Useful for tests that want fast
+    /// convergence on stationary signals.
+    pub fn with_mu(mut self, mu: f32) -> Self {
+        self.mu = mu;
+        self
+    }
+
+    /// Index of the largest |w[k]|. Useful as a "where is the echo"
+    /// readout — a converged filter on a clean delayed echo will peak
+    /// at exactly the propagation delay.
+    fn peak_tap(&self) -> (usize, f32) {
+        let mut idx = 0;
+        let mut peak = 0.0f32;
+        for (i, &v) in self.w.iter().enumerate() {
+            if v.abs() > peak {
+                peak = v.abs();
+                idx = i;
+            }
+        }
+        (idx, peak)
+    }
+}
+
+impl AecKernel for NlmsAec {
+    fn process(&mut self, mic_frame: &[f32], ref_history: &[f32]) -> Vec<f32> {
+        let n = mic_frame.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let n_taps = self.n_taps;
+
+        self.frames_since_update = self.frames_since_update.saturating_add(1);
+
+        // Need n_taps samples of ref history per output sample, plus
+        // the n samples of the current frame. Smallest index touched
+        // is `ref_history.len() - n - n_taps + 1`, which must be ≥ 0.
+        if ref_history.len() < n_taps + n {
+            self.last_stats = None;
+            return mic_frame.to_vec();
+        }
+
+        // ref_pos for mic_frame[i] is ref_history.len() - n + i — i.e.
+        // the most recent ref sample arrives in time-step with the
+        // newest mic sample. The ref-window for output sample i covers
+        // [ref_pos - n_taps + 1, ref_pos].
+        let ref_first = ref_history.len() - n;
+
+        // Frame-level RMS for double-talk gating + silence detection.
+        let frame_mic_e = dot(mic_frame, mic_frame);
+        let frame_mic_rms = (frame_mic_e / n as f32).sqrt();
+
+        // Reference window covering the whole frame (union of per-sample
+        // windows). Cheap because it's just one pass — n + n_taps - 1
+        // samples for n=320, n_taps=4096 ≈ 4400 samples.
+        let ref_block_start = ref_first + 1 - n_taps; // = ref_history.len() - n - n_taps + 1
+        let ref_block = &ref_history[ref_block_start..ref_history.len()];
+        let ref_block_e = dot(ref_block, ref_block);
+        let frame_ref_rms = (ref_block_e / ref_block.len() as f32).sqrt();
+
+        if frame_ref_rms < self.ref_silence_rms {
+            self.last_stats = None;
+            return mic_frame.to_vec();
+        }
+
+        let in_double_talk = frame_mic_rms > self.double_talk_ratio * frame_ref_rms;
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let ref_pos = ref_first + i;
+
+            // Echo estimate: y_hat = sum_{k=0..n_taps-1} w[k] · ref[ref_pos - k].
+            let mut y_hat = 0.0f32;
+            for k in 0..n_taps {
+                y_hat += self.w[k] * ref_history[ref_pos - k];
+            }
+            let e = mic_frame[i] - y_hat;
+            out.push(e);
+
+            // Adaptation. Sample-aligned ‖x‖² (sliding window, but we
+            // recompute for clarity — the per-sample cost is the same
+            // order as y_hat itself; if profiling forces the issue we
+            // can swap to a running sum).
+            if !in_double_talk {
+                let mut x_norm2 = 0.0f32;
+                for k in 0..n_taps {
+                    let r = ref_history[ref_pos - k];
+                    x_norm2 += r * r;
+                }
+                let step = self.mu * e / (x_norm2 + self.delta);
+                for k in 0..n_taps {
+                    self.w[k] += step * ref_history[ref_pos - k];
+                }
+            }
+        }
+
+        if !in_double_talk {
+            self.frames_since_update = 0;
+        }
+
+        let frame_clean_e = dot(&out, &out);
+        let (peak_idx, peak_val) = self.peak_tap();
+
+        // FrameStats interpretation for NLMS:
+        // - best_d   = peak filter tap (where the IR has its maximum)
+        // - gain     = peak |w[k]| (filter strength at that tap)
+        // - confidence = 0.0 during double-talk, 1.0 otherwise
+        //   (NLMS doesn't have the cross-correlation cosine the
+        //    spectral kernel uses; this gives the diagnostic log
+        //    a similarly-shaped 0..1 indicator of "is the kernel
+        //    confidently adapting right now").
+        // - mic_energy / ref_energy keep the long-window meaning
+        //   (frame-level here, since NLMS doesn't carry a separate
+        //   long buffer).
+        self.last_stats = Some(FrameStats {
+            best_d: peak_idx,
+            confidence: if in_double_talk { 0.0 } else { 1.0 },
+            gain: peak_val,
+            mic_energy: frame_mic_e,
+            ref_energy: ref_block_e,
+            mic_frame_energy: frame_mic_e,
+            cleaned_frame_energy: frame_clean_e,
+        });
+
+        out
+    }
+
+    fn last_frame_stats(&self) -> Option<&FrameStats> {
+        self.last_stats.as_ref()
+    }
+
+    fn delay_estimate(&self) -> f32 {
+        self.peak_tap().0 as f32
+    }
+
+    fn frames_since_lock(&self) -> u64 {
+        self.frames_since_update
     }
 }
 
@@ -547,6 +787,149 @@ mod tests {
             user_to_clean < user_to_mic * 0.1,
             "expected cleaned to be ≥10× closer to user signal; \
              user_to_mic={user_to_mic:.4}, user_to_clean={user_to_clean:.4}"
+        );
+    }
+
+    /// NLMS settle period. Filter has 4096 default taps; for a clean
+    /// delayed-echo target with white noise input, NLMS converges in
+    /// roughly 5–10× N samples = ~30k samples = ~2 s. We push 4 s of
+    /// audio and measure ERLE in the last 1 s, well past the
+    /// transient.
+    const NLMS_TOTAL: usize = 4 * 16_000;
+    const NLMS_MEASURE_FROM: usize = 3 * 16_000;
+
+    #[test]
+    fn nlms_pure_echo_25db() {
+        // Same scenario as `pure_echo_is_cancelled` but with NlmsAec —
+        // spec acceptance is ≥25 dB ERLE on this synthetic case.
+        let reference = lcg_noise(NLMS_TOTAL, 0xC0FFEE, 0.4);
+        let delay = 800;
+        let gain = 0.6;
+        let mut mic = vec![0f32; NLMS_TOTAL];
+        for i in delay..NLMS_TOTAL {
+            mic[i] = reference[i - delay] * gain;
+        }
+
+        let mut history = ReferenceHistory::new(48_000);
+        let mut kernel = NlmsAec::new();
+        let chunk = 320;
+
+        let mut mic_residual = 0f32;
+        let mut clean_residual = 0f32;
+        let mut pos = 0;
+        while pos + chunk <= NLMS_TOTAL {
+            history.push(&reference[pos..pos + chunk]);
+            let snap = history.snapshot();
+            let cleaned = kernel.process(&mic[pos..pos + chunk], &snap);
+            if pos >= NLMS_MEASURE_FROM {
+                for i in 0..chunk {
+                    mic_residual += mic[pos + i] * mic[pos + i];
+                    clean_residual += cleaned[i] * cleaned[i];
+                }
+            }
+            pos += chunk;
+        }
+
+        let suppression_db = 10.0 * (mic_residual / clean_residual.max(1e-12)).log10();
+        assert!(
+            suppression_db >= 25.0,
+            "expected NLMS ≥25 dB ERLE on pure echo, got {suppression_db:.1} dB \
+             (mic_residual={mic_residual:.4}, clean_residual={clean_residual:.4})"
+        );
+
+        // Sanity: peak filter tap should land at the true delay (±a few
+        // samples for stochastic gradient noise).
+        let (peak_idx, peak_val) = kernel.peak_tap();
+        assert!(
+            (peak_idx as i64 - delay as i64).abs() <= 4,
+            "expected peak filter tap near delay {delay}, got {peak_idx} (val={peak_val:.3})"
+        );
+        assert!(
+            (peak_val - gain).abs() < 0.1,
+            "expected peak filter value near echo gain {gain}, got {peak_val:.3}"
+        );
+    }
+
+    #[test]
+    fn nlms_silent_reference_passes_through() {
+        // Mirror of `user_speech_passes_through_when_reference_is_silent`
+        // for the NLMS kernel — silent ref must yield mic unchanged.
+        let n = 4000;
+        let mic: Vec<f32> = (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 300.0 * (i as f32 / SR as f32)).sin() * 0.5)
+            .collect();
+        let reference = vec![0f32; n];
+
+        let mut history = ReferenceHistory::new(48_000);
+        let mut kernel = NlmsAec::new();
+        let chunk = 320;
+
+        let mut max_diff = 0f32;
+        let mut pos = 0;
+        while pos + chunk <= n {
+            history.push(&reference[pos..pos + chunk]);
+            let snap = history.snapshot();
+            let cleaned = kernel.process(&mic[pos..pos + chunk], &snap);
+            for i in 0..chunk {
+                max_diff = max_diff.max((mic[pos + i] - cleaned[i]).abs());
+            }
+            pos += chunk;
+        }
+        assert!(
+            max_diff < 1e-6,
+            "silent reference should pass mic through unchanged, max_diff={max_diff}"
+        );
+    }
+
+    #[test]
+    fn nlms_user_plus_echo_keeps_user() {
+        // Realistic double-talk pattern: ref (TTS) active throughout;
+        // user (near-end speech) intermittent, only present in the
+        // back half. The first half lets NLMS converge on the echo
+        // IR cleanly; in the second half double-talk freeze should
+        // hold the filter steady while the now-converged
+        // (mic − filter·ref) leaves the user signal untouched.
+        let reference = lcg_noise(NLMS_TOTAL, 0xC0FFEE, 0.4);
+        let user_full = lcg_noise(NLMS_TOTAL, 0xBADBEEF, 0.5);
+        let user_start = NLMS_TOTAL / 2;
+        let mut user = vec![0f32; NLMS_TOTAL];
+        user[user_start..].copy_from_slice(&user_full[user_start..]);
+
+        let delay = 800;
+        let echo_gain = 0.5;
+        let mut mic = user.clone();
+        for i in delay..NLMS_TOTAL {
+            mic[i] += reference[i - delay] * echo_gain;
+        }
+
+        let mut history = ReferenceHistory::new(48_000);
+        let mut kernel = NlmsAec::new();
+        let chunk = 320;
+
+        let mut user_to_mic = 0f32;
+        let mut user_to_clean = 0f32;
+        let mut pos = 0;
+        while pos + chunk <= NLMS_TOTAL {
+            history.push(&reference[pos..pos + chunk]);
+            let snap = history.snapshot();
+            let cleaned = kernel.process(&mic[pos..pos + chunk], &snap);
+            // Measure during the user-active back half, well past the
+            // mid-stream double-talk onset.
+            if pos >= NLMS_MEASURE_FROM {
+                for i in 0..chunk {
+                    let dm = mic[pos + i] - user[pos + i];
+                    let dc = cleaned[i] - user[pos + i];
+                    user_to_mic += dm * dm;
+                    user_to_clean += dc * dc;
+                }
+            }
+            pos += chunk;
+        }
+        assert!(
+            user_to_clean < user_to_mic * 0.1,
+            "expected NLMS cleaned to be ≥10× closer to user signal during \
+             double-talk; user_to_mic={user_to_mic:.4}, \
+             user_to_clean={user_to_clean:.4}"
         );
     }
 }

@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nemotron_speech::aec::{AecKernel, ReferenceHistory, SpectralSubtractionAec};
+use nemotron_speech::aec::{AecKernel, NlmsAec, ReferenceHistory, SpectralSubtractionAec};
 use nemotron_speech::audio::load_audio_mono_16k;
 use std::path::PathBuf;
 
@@ -41,6 +41,10 @@ struct Args {
     /// Print per-frame AEC stats (delay, confidence, gain).
     #[arg(long, default_value_t = false)]
     verbose: bool,
+    /// AEC kernel: `nlms` (default, multi-tap adaptive FIR) or `spectral`
+    /// (phase A single-tap cross-correlation, kept as fallback).
+    #[arg(long, default_value = "nlms", value_parser = ["nlms", "spectral"])]
+    kernel: String,
 }
 
 fn main() -> Result<()> {
@@ -63,7 +67,12 @@ fn main() -> Result<()> {
     );
 
     let mut history = ReferenceHistory::new(args.history);
-    let mut kernel = SpectralSubtractionAec::new();
+    let mut kernel: Box<dyn AecKernel> = match args.kernel.as_str() {
+        "spectral" => Box::new(SpectralSubtractionAec::new()),
+        "nlms" => Box::new(NlmsAec::new()),
+        other => unreachable!("clap allowed unexpected --kernel {other}"),
+    };
+    eprintln!("kernel: {}", args.kernel);
 
     let frame = args.frame;
     let mut cleaned: Vec<f32> = Vec::with_capacity(mic.len());
