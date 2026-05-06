@@ -173,7 +173,6 @@ impl SpectralSubtractionAec {
         self.search_max = max;
         self
     }
-
 }
 
 #[derive(Debug, Clone, Copy)]
