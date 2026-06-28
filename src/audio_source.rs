@@ -70,15 +70,14 @@ impl AudioSource for FileChunkSource {
     }
 }
 
-/// UDP source: receives raw PCM `f32` little-endian samples (16 kHz mono)
-/// over UDP, accumulates them, and yields fixed-size audio chunks. Each
-/// datagram's bytes are interpreted as a contiguous slice of f32 samples
-/// and appended to an internal buffer; chunks are emitted whenever the
-/// buffer reaches `chunk_samples`.
+/// UDP source: receives RTP/L16 datagrams (16 kHz mono) over UDP, strips the
+/// RTP header, decodes the L16 payload to `f32`, accumulates the samples, and
+/// yields fixed-size audio chunks whenever the buffer reaches `chunk_samples`.
 ///
-/// Wire format: a datagram of `4 * N` bytes carries `N` f32 samples in
-/// little-endian order. Datagrams whose length isn't a multiple of 4 are
-/// dropped with a warning (likely a sender bug).
+/// Wire format: RTP (RFC 3550) header (12 bytes for our sender — V=2, no
+/// CSRC/extension) followed by an L16 payload (RFC 3551): 16-bit signed PCM in
+/// big-endian / network byte order. Non-RTP datagrams are dropped with a
+/// warning. (Was raw f32-LE before the RTP migration.)
 ///
 /// Loss/reorder: UDP gives no guarantees, but for a local LAN with a
 /// single sender both are essentially zero. We don't sequence-number for
@@ -118,25 +117,36 @@ impl AudioSource for UdpSource {
     }
 
     async fn next_chunk(&mut self) -> Result<Option<AudioChunk>> {
+        // RTP (RFC 3550) carrying an L16 payload: 16-bit signed big-endian PCM
+        // @16 kHz. 12-byte header (V=2, no CSRC/extension from our sender, but
+        // we parse CC/X defensively), then the samples.
+        const RTP_HDR: usize = 12;
         while self.buffer.len() < self.chunk_samples {
             let (n, _peer) = self.socket.recv_from(&mut self.recv_buf).await?;
-            if n % 4 != 0 {
-                tracing::warn!(
-                    "ignoring UDP datagram of {n} bytes (not a multiple of 4 — expected raw f32 LE)"
-                );
+            if n < RTP_HDR + 2 || (self.recv_buf[0] >> 6) != 2 {
+                tracing::warn!("ignoring non-RTP datagram of {n} bytes (expected RTP/L16)");
                 continue;
             }
-            let n_samples = n / 4;
+            let cc = (self.recv_buf[0] & 0x0f) as usize;
+            let mut hdr = RTP_HDR + cc * 4;
+            if self.recv_buf[0] & 0x10 != 0 {
+                // extension header: 4 bytes + (length-in-words * 4)
+                if n < hdr + 4 {
+                    continue;
+                }
+                let words =
+                    ((self.recv_buf[hdr + 2] as usize) << 8) | self.recv_buf[hdr + 3] as usize;
+                hdr += 4 + words * 4;
+            }
+            if n <= hdr {
+                continue;
+            }
+            let n_samples = (n - hdr) / 2;
             self.buffer.reserve(n_samples);
             for i in 0..n_samples {
-                let off = i * 4;
-                let bytes = [
-                    self.recv_buf[off],
-                    self.recv_buf[off + 1],
-                    self.recv_buf[off + 2],
-                    self.recv_buf[off + 3],
-                ];
-                self.buffer.push(f32::from_le_bytes(bytes));
+                let off = hdr + i * 2;
+                let s = i16::from_be_bytes([self.recv_buf[off], self.recv_buf[off + 1]]);
+                self.buffer.push(s as f32 / 32768.0);
             }
         }
         let chunk: Vec<f32> = self.buffer.drain(..self.chunk_samples).collect();

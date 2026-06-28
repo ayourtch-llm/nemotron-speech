@@ -51,8 +51,8 @@ struct Args {
     /// Read from the default microphone (requires `--features mic`).
     #[arg(long, default_value_t = false, conflicts_with = "udp_listen")]
     mic: bool,
-    /// Bind a UDP socket and treat each datagram as raw f32-LE 16 kHz mono PCM.
-    /// Example: `--udp-listen 0.0.0.0:9999`.
+    /// Bind a UDP socket and treat each datagram as RTP/L16 (16-bit big-endian
+    /// PCM, 16 kHz mono). Example: `--udp-listen 0.0.0.0:9999`.
     #[arg(long)]
     udp_listen: Option<String>,
     /// Mirror each emitted chunk as plain text (newline-terminated) to a UDP
