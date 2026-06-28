@@ -123,19 +123,25 @@ fn main() -> Result<()> {
     use std::io::Write;
     std::io::stdout().flush().ok();
 
+    let mut enc_time = std::time::Duration::ZERO;
+    let mut dec_time = std::time::Duration::ZERO;
     let t0 = std::time::Instant::now();
     for c in 0..n_chunks {
         let start = c * chunk_size;
         let len = chunk_size.min(t_total - start);
         let chunk = subsampled.narrow(1, start, len)?.contiguous()?;
+        let te = std::time::Instant::now();
         let enc_out = encoder
             .forward_layers_chunked(&chunk, &mut enc_cache)
             .map_err(|e| anyhow::anyhow!("chunk {} forward: {e:#}", c))?;
+        enc_time += te.elapsed();
         // Greedy-decode this chunk: state carries across chunks, so simply
         // call decode once per encoded chunk. enc_out is (1, T, d_enc).
         let enc_seq = enc_out.squeeze(0)?;
         let prev_len = all_tokens.len();
+        let td = std::time::Instant::now();
         dec.decode(&enc_seq, &predict, &joint, &mut all_tokens)?;
+        dec_time += td.elapsed();
         if all_tokens.len() > prev_len {
             // Emit the new tokens incrementally — detokenize the prefix
             // and print whatever's new since the last emission.
@@ -153,5 +159,6 @@ fn main() -> Result<()> {
     }
     println!();
     println!("\ntotal: {} tokens in {:?}", all_tokens.len(), t0.elapsed());
+    println!("  encoder chunks: {:?}   decode: {:?}", enc_time, dec_time);
     Ok(())
 }
