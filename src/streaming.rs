@@ -134,11 +134,26 @@ impl StreamingPipeline {
     /// Try to process one chunk. Returns the new tokens emitted (if any).
     /// Returns Ok(None) when there isn't enough buffered audio yet.
     pub fn try_advance(&mut self) -> Result<Option<Vec<u32>>> {
-        self.drain_subsample()?;
         let chunk_size = self.cfg.chunk_size_enc_frames();
+        let want = self.max_chunk_batch.max(1);
+        let finished = self.mel.is_finished();
+        // Batch the subsample stack the same way as the encoder: defer
+        // draining until roughly `want` chunks of mel have piled up, so
+        // `forward_incremental` runs on one large block instead of once per
+        // ~320-sample push. This amortises per-op dispatch overhead — the
+        // dominant cost on Metal, where the per-push subsample otherwise
+        // floors throughput below real time. Output is identical regardless
+        // of block size (the incremental subsample carries exact rolling
+        // state). The advance gate below still enforces full-chunk
+        // boundaries, so an imperfect mel estimate only delays a pass, never
+        // corrupts it.
+        let pending_mel = self.mel.n_frames_emitted() - self.mel_consumed;
+        let target_mel = want * chunk_size * self.cfg.subsampling_factor;
+        if finished || pending_mel >= target_mel {
+            self.drain_subsample()?;
+        }
         let avail = self.sub_state.n_emitted;
         let ready = avail.saturating_sub(self.encoded_so_far);
-        let finished = self.mel.is_finished();
         if ready < chunk_size {
             // Not a full chunk yet. Flush the partial tail only once the
             // stream has ended (right-context will never arrive).
@@ -156,7 +171,6 @@ impl StreamingPipeline {
         // `max_chunk_batch` chunks (~1.12 s each) of latency for throughput,
         // which is what makes Metal viable. The stream-ended case always
         // flushes whatever is buffered.
-        let want = self.max_chunk_batch.max(1);
         let full_chunks = ready / chunk_size;
         if !finished && full_chunks < want {
             return Ok(None);
