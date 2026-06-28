@@ -119,6 +119,13 @@ struct Args {
     webrtc_stream_delay_ms: u16,
     #[arg(long, default_value_t = false)]
     cpu: bool,
+    /// Fuse up to N encoder chunks (each ~1.12 s of audio) into a single
+    /// encoder pass. 1 = lowest latency (per-chunk). Larger values amortise
+    /// per-op dispatch overhead — essential on Metal, where per-chunk
+    /// processing runs slower than real time — at the cost of up to N chunks
+    /// of extra latency. Numerically identical regardless of N.
+    #[arg(long, default_value_t = 1)]
+    chunk_batch: usize,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -166,6 +173,8 @@ async fn main() -> Result<()> {
 
     let mut pipe =
         StreamingPipeline::new(encoder, predict, joint, mel, mel_cfg, cfg, device, dtype)?;
+    pipe.set_max_chunk_batch(args.chunk_batch);
+    eprintln!("chunk_batch: {}", args.chunk_batch.max(1));
 
     let mut source: Box<dyn AudioSource> = if let Some(p) = &args.audio {
         let samples = load_audio_mono_16k(p)?;

@@ -36,6 +36,11 @@ struct Args {
     /// mask; output must still match the reference within `atol`.
     #[arg(long, default_value_t = 1)]
     batch: usize,
+    /// Run on Metal instead of CPU (requires the `metal` feature). Lets us
+    /// isolate the conformer-encoder cost on the GPU from the rest of the
+    /// live pipeline.
+    #[arg(long, default_value_t = false)]
+    metal: bool,
 }
 
 fn main() -> Result<()> {
@@ -47,8 +52,20 @@ fn main() -> Result<()> {
         .init();
     let args = Args::parse();
 
-    let device = Device::Cpu;
+    let device = if args.metal {
+        #[cfg(feature = "metal")]
+        {
+            Device::new_metal(0).context("opening Metal device")?
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            bail!("rebuild with --features metal to use --metal");
+        }
+    } else {
+        Device::Cpu
+    };
     let dtype = DType::F32;
+    println!("device: {:?}", device);
 
     let audio_v = audio::load_audio_mono_16k(&args.audio)?;
     let mel_cfg = MelConfig::nemotron_default();

@@ -138,19 +138,31 @@ impl StreamingPipeline {
         let chunk_size = self.cfg.chunk_size_enc_frames();
         let avail = self.sub_state.n_emitted;
         let ready = avail.saturating_sub(self.encoded_so_far);
+        let finished = self.mel.is_finished();
         if ready < chunk_size {
             // Not a full chunk yet. Flush the partial tail only once the
             // stream has ended (right-context will never arrive).
-            if self.mel.is_finished() && ready > 0 {
+            if finished && ready > 0 {
                 return self.advance_chunk(ready).map(Some);
             }
             return Ok(None);
         }
-        // Run as many whole chunks as are buffered, up to the batch cap, in
-        // a single fused encoder pass. The block-causal mask inside the
-        // encoder makes this byte-identical to processing them one at a time.
-        let full_chunks = (ready / chunk_size).min(self.max_chunk_batch);
-        self.advance_chunk(full_chunks * chunk_size).map(Some)
+        // Fuse whole chunks into one encoder pass to amortise per-op
+        // dispatch overhead (the block-causal mask keeps this byte-identical
+        // to processing them one at a time). When batching is enabled we
+        // deliberately wait until `max_chunk_batch` whole chunks have
+        // accumulated before running — otherwise the caller drains one chunk
+        // at a time and the batch never fills. This trades up to
+        // `max_chunk_batch` chunks (~1.12 s each) of latency for throughput,
+        // which is what makes Metal viable. The stream-ended case always
+        // flushes whatever is buffered.
+        let want = self.max_chunk_batch.max(1);
+        let full_chunks = ready / chunk_size;
+        if !finished && full_chunks < want {
+            return Ok(None);
+        }
+        let take = full_chunks.min(want);
+        self.advance_chunk(take * chunk_size).map(Some)
     }
 
     fn advance_chunk(&mut self, len: usize) -> Result<Vec<u32>> {
