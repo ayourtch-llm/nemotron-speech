@@ -72,19 +72,38 @@ cp models/extracted/*tokenizer.model models/tokenizer.model
 ## Build features
 
 ```toml
-default = ["cpu"]
-metal   = ["candle-core/metal", "candle-nn/metal"]
-cuda    = ["candle-core/cuda",  "candle-nn/cuda"]
-mic     = [...]   # cpal microphone source
+default    = ["cpu"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]  # Apple BLAS (macOS CPU)
+metal      = ["candle-core/metal", "candle-nn/metal"]
+cuda       = ["candle-core/cuda",  "candle-nn/cuda"]
+mic        = [...]   # cpal microphone source
 ```
 
 ```sh
+cargo run --release --no-default-features --features accelerate --bin transcribe -- ...
 cargo run --release --features metal --bin transcribe -- ...
 cargo run --release --features cuda  --bin transcribe -- ...
 cargo run --release --features mic   --bin transcribe_live -- --mic ...
 ```
 
 Device selection at runtime: `--cpu` forces CPU even when a GPU feature is enabled; otherwise the binary tries Metal/CUDA first and falls back to CPU.
+
+On macOS CPU, build with `--no-default-features --features accelerate` to route matmuls through Apple's Accelerate BLAS (~1.6× on the matmul-bound offline path).
+
+## Chunk batching (`--chunk-batch`, throughput vs latency)
+
+`transcribe_live` accepts `--chunk-batch N` (default 1): it fuses **N encoder chunks into one pass** (both the subsample stack and the conformer layers), amortising per-op dispatch overhead. A block-causal attention mask makes the result **byte-equivalent** to processing one chunk at a time — verified by `streaming_check --batch N` (max abs diff vs the offline+mask reference stays ~4e-6 for N up to 8).
+
+This is what makes **Metal usable for live audio**. Per-chunk (N=1), Metal launches thousands of tiny GPU ops/sec and runs *slower than real time* — the original ~80%-audio-drop failure mode. Batching turns those into a few large dispatches:
+
+| `--chunk-batch` | Metal, 40 s clip (incl. load) | realtime | worst-case latency |
+|---|---|---|---|
+| 1 | ~45 s | ~1.0× (drops audio) | ~1.1 s |
+| 2 | ~26 s | ~1.85× | ~2.2 s |
+| 8 | ~13.5 s | ~4.2× | ~9 s |
+| 16 | ~7.5 s | ~5.3× | ~18 s |
+
+The trade is **linear: latency ≈ N × 1.12 s** worst-case, because the pipeline waits for N whole chunks (1.12 s each) before emitting a burst. So high N is for file/batch transcription or catching up; for a conversational loop use **N=2** (keeps up on Metal at ~1.1 s average latency, leaving the CPU nearly free). On CPU every N keeps up — there, N>1 only matters to free cores for other work.
 
 ## Model architecture (this checkpoint)
 
@@ -129,9 +148,9 @@ tools/
 
 ## What's still on the list
 
-- **Mic source: stop dropping samples.** `MicSource::open_default` uses `tx.try_send` which silently drops when the channel backs up. Switching to `blocking_send` or growing the depth-64 channel would prevent the live-mic-on-Metal failure mode.
-- **Batch incremental subsample drains.** Currently called on every `try_advance` (often a single new mel frame). Deferring until ≥32 frames are available is bit-exact in `subsample_check` and would reduce per-call kernel-launch overhead, especially on Metal.
-- **Longer-utterance test.** A multi-minute clip would actually exercise the chunked-limited attention mask (no-op on the 5 s clip per the assumed `att_context_size`) and let CUDA pull ahead of CPU on raw throughput.
+- **Mic source: stop dropping samples.** `MicSource::open_default` uses `tx.try_send` which silently drops when the channel backs up. Switching to `blocking_send` or growing the depth-64 channel would prevent live-mic drops. (The other half of the old Metal failure — per-op overhead — is now addressed by `--chunk-batch`; this part is independent and still open.)
+- **Adaptive `--chunk-batch`.** Today N is fixed. Batching N=1 at the live edge and raising N only when a backlog builds would give high-N resilience at N=1 latency in steady state.
+- **Longer-utterance test.** Done for benchmarking via a repeated-clip 40 s file (exercises the chunked-limited attention mask, which is a no-op on the 5 s clip). A real multi-minute clip would let CUDA pull ahead of CPU on raw throughput.
 
 ## License
 

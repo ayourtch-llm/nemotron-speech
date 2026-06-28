@@ -171,10 +171,19 @@ async fn main() -> Result<()> {
     let joint = JointNet::new(vb.pp("joint"), &cfg).map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
     let tok = Tokenizer::from_file(&args.tok)?;
 
+    let on_metal = device.is_metal();
     let mut pipe =
         StreamingPipeline::new(encoder, predict, joint, mel, mel_cfg, cfg, device, dtype)?;
     pipe.set_max_chunk_batch(args.chunk_batch);
     eprintln!("chunk_batch: {}", args.chunk_batch.max(1));
+    if on_metal && args.chunk_batch <= 1 {
+        eprintln!(
+            "note: on Metal the per-chunk path launches thousands of tiny GPU ops/sec \
+             and can run slower than real time (dropping live audio). Pass \
+             --chunk-batch N (e.g. 2 for low latency, 8+ for throughput) to fuse \
+             chunks into larger GPU passes."
+        );
+    }
 
     let mut source: Box<dyn AudioSource> = if let Some(p) = &args.audio {
         let samples = load_audio_mono_16k(p)?;
