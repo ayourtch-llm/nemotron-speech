@@ -588,6 +588,57 @@ pub fn chunked_limited_mask(
     Ok(m)
 }
 
+/// Block-causal additive mask for the *cache-aware* path when a batch spans
+/// more than one chunk. Shape `(1, 1, t_q, t_kv)` where `t_kv = cache_len +
+/// t_q`. Frames are grouped into `chunk_size` blocks; query frame in chunk
+/// `qc` (relative to the batch start) may attend to a key frame in chunk
+/// `kc` iff `kc <= qc && qc - kc <= left_chunks`. The cache occupies the
+/// `left_chunks` chunks immediately preceding the batch (so its relative
+/// chunk indices are negative).
+///
+/// `cache_len` must be a multiple of `chunk_size` (the streaming KV cache is
+/// always chunk-aligned). Returns `None` when the result would be all-zeros
+/// (a single chunk with full cache visibility) so callers can skip the
+/// broadcast-add entirely — this keeps the `M == 1` path byte-identical to
+/// the pre-batching implementation.
+pub fn batched_chunk_mask(
+    t_q: usize,
+    cache_len: usize,
+    chunk_size: usize,
+    left_chunks: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Tensor>> {
+    debug_assert_eq!(cache_len % chunk_size, 0, "KV cache must be chunk-aligned");
+    let cache_chunks = (cache_len / chunk_size) as i64;
+    let t_kv = cache_len + t_q;
+    let neg_inf = -1e9f32;
+    let mut data = vec![0.0f32; t_q * t_kv];
+    let mut any_masked = false;
+    for qi in 0..t_q {
+        let qc = (qi / chunk_size) as i64;
+        for kj in 0..t_kv {
+            // Relative chunk index: cache frames sit in chunks
+            // [-cache_chunks, -1]; batch frames in [0, ...].
+            let kc = if kj < cache_len {
+                (kj / chunk_size) as i64 - cache_chunks
+            } else {
+                ((kj - cache_len) / chunk_size) as i64
+            };
+            let visible = kc <= qc && qc - kc <= left_chunks as i64;
+            if !visible {
+                data[qi * t_kv + kj] = neg_inf;
+                any_masked = true;
+            }
+        }
+    }
+    if !any_masked {
+        return Ok(None);
+    }
+    let m = Tensor::from_vec(data, (1, 1, t_q, t_kv), device)?.to_dtype(dtype)?;
+    Ok(Some(m))
+}
+
 // ---------------------------------------------------------------------------
 // Multi-Head Attention with relative positional embeddings (Transformer-XL)
 // ---------------------------------------------------------------------------
@@ -723,6 +774,7 @@ impl RelPosMha {
         x: &Tensor,
         pos_emb: &Tensor,
         kv_cache_in: Option<&Tensor>,
+        attn_bias: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
         let (b, t_q, _d) = x.dims3()?;
         let h = self.n_heads;
@@ -782,6 +834,10 @@ impl RelPosMha {
 
         let scale = 1.0 / (dh as f64).sqrt();
         let scores = (matrix_ac + matrix_bd)?.affine(scale, 0.0)?;
+        let scores = match attn_bias {
+            Some(bias) => scores.broadcast_add(bias)?,
+            None => scores,
+        };
         let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = attn.matmul(&v)?;
         let ctx = ctx
@@ -888,6 +944,7 @@ impl ConformerLayer {
         x: &Tensor,
         pos_emb: &Tensor,
         cache: &mut LayerCache,
+        attn_bias: Option<&Tensor>,
     ) -> Result<Tensor> {
         // FF1 macaron half
         let r = x.clone();
@@ -898,7 +955,9 @@ impl ConformerLayer {
         // Self-attention with KV cache
         let r = x.clone();
         let y = self.norm_attn.forward(&x)?;
-        let (y, kv_full) = self.attn.forward_chunked(&y, pos_emb, cache.kv.as_ref())?;
+        let (y, kv_full) = self
+            .attn
+            .forward_chunked(&y, pos_emb, cache.kv.as_ref(), attn_bias)?;
         cache.kv = Some(kv_full);
         let x = (r + y)?;
 
@@ -1031,10 +1090,25 @@ impl FastConformerEncoder {
             encoded_chunk.dtype(),
         )?;
 
+        // When the batch spans more than one chunk (t_q > chunk_size) the
+        // intra-batch frames must respect the trained chunked-limited
+        // attention pattern; build the block-causal mask once and share it
+        // across all layers. For a single chunk this returns None (all
+        // frames mutually visible), keeping the M==1 path byte-identical.
+        let chunk_size = self.cfg.chunk_size_enc_frames();
+        let mask = batched_chunk_mask(
+            t_q,
+            cache_len,
+            chunk_size,
+            self.cfg.left_chunks(),
+            encoded_chunk.device(),
+            encoded_chunk.dtype(),
+        )?;
+
         let max_kv = self.cfg.att_context_size[0];
         let mut x = encoded_chunk.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward_chunked(&x, &pos, &mut cache.layers[i])?;
+            x = layer.forward_chunked(&x, &pos, &mut cache.layers[i], mask.as_ref())?;
             // Trim KV cache: keep last `max_kv` frames.
             if let Some(kv) = cache.layers[i].kv.take() {
                 let (_, n, _) = kv.dims3()?;

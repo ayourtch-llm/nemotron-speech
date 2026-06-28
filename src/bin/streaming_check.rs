@@ -31,6 +31,11 @@ struct Args {
     st: PathBuf,
     #[arg(long, default_value_t = 5e-3)]
     atol: f32,
+    /// Number of chunks to fuse into one `forward_layers_chunked` call.
+    /// 1 = original per-chunk path. >1 exercises the block-causal batched
+    /// mask; output must still match the reference within `atol`.
+    #[arg(long, default_value_t = 1)]
+    batch: usize,
 }
 
 fn main() -> Result<()> {
@@ -80,26 +85,29 @@ fn main() -> Result<()> {
         .forward(&mel_t)
         .map_err(|e| anyhow::anyhow!("subsample: {e:#}"))?;
     let chunk_size = cfg.chunk_size_enc_frames();
-    let n_chunks = (t_total + chunk_size - 1) / chunk_size;
+    let batch = args.batch.max(1);
+    let step = chunk_size * batch;
+    let n_steps = (t_total + step - 1) / step;
     let mut cache = EncoderCache::empty(cfg.n_layers);
-    let mut chunk_outs: Vec<Tensor> = Vec::with_capacity(n_chunks);
+    let mut chunk_outs: Vec<Tensor> = Vec::with_capacity(n_steps);
 
     let t0 = std::time::Instant::now();
-    for c in 0..n_chunks {
-        let start = c * chunk_size;
-        let len = (chunk_size).min(t_total - start);
+    for c in 0..n_steps {
+        let start = c * step;
+        let len = step.min(t_total - start);
         let chunk = subsampled.narrow(1, start, len)?.contiguous()?;
         let out = encoder
             .forward_layers_chunked(&chunk, &mut cache)
-            .map_err(|e| anyhow::anyhow!("chunk {} forward: {e:#}", c))?;
+            .map_err(|e| anyhow::anyhow!("step {} forward: {e:#}", c))?;
         chunk_outs.push(out);
     }
     let t_stream = t0.elapsed();
     let stream_out = Tensor::cat(&chunk_outs.iter().collect::<Vec<_>>(), 1)?;
     println!(
-        "streaming ({} chunks of size {}): shape {:?} in {:?}",
-        n_chunks,
-        chunk_size,
+        "streaming ({} passes of up to {} frames, batch={}): shape {:?} in {:?}",
+        n_steps,
+        step,
+        batch,
         stream_out.dims(),
         t_stream
     );

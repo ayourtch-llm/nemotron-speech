@@ -33,6 +33,15 @@ pub struct StreamingPipeline {
     cache: EncoderCache,
     decoder: GreedyDecoder,
     pub all_tokens: Vec<u32>,
+    /// Maximum number of `chunk_size` blocks to run through the conformer
+    /// encoder in a single batched pass. 1 = original per-chunk behaviour
+    /// (lowest latency). Larger values amortise per-op dispatch overhead —
+    /// the difference between Metal being unusable (~0.8x realtime at
+    /// batch 1) and keeping up — at the cost of up to `max_chunk_batch`
+    /// chunks (~1.1s each) of extra algorithmic latency. Numerically
+    /// identical regardless of the value (a block-causal mask reproduces
+    /// the per-chunk attention pattern).
+    max_chunk_batch: usize,
 }
 
 impl StreamingPipeline {
@@ -71,7 +80,14 @@ impl StreamingPipeline {
             cache,
             decoder,
             all_tokens: Vec::new(),
+            max_chunk_batch: 1,
         })
+    }
+
+    /// Set how many `chunk_size` blocks may be fused into one encoder pass.
+    /// Clamped to at least 1. See `max_chunk_batch`.
+    pub fn set_max_chunk_batch(&mut self, n: usize) {
+        self.max_chunk_batch = n.max(1);
     }
 
     /// Append more audio. Pre-emphasis + STFT framing run as samples arrive;
@@ -121,14 +137,20 @@ impl StreamingPipeline {
         self.drain_subsample()?;
         let chunk_size = self.cfg.chunk_size_enc_frames();
         let avail = self.sub_state.n_emitted;
-        let needed = self.encoded_so_far + chunk_size;
-        if avail < needed {
-            if self.mel.is_finished() && avail > self.encoded_so_far {
-                return self.advance_chunk(avail - self.encoded_so_far).map(Some);
+        let ready = avail.saturating_sub(self.encoded_so_far);
+        if ready < chunk_size {
+            // Not a full chunk yet. Flush the partial tail only once the
+            // stream has ended (right-context will never arrive).
+            if self.mel.is_finished() && ready > 0 {
+                return self.advance_chunk(ready).map(Some);
             }
             return Ok(None);
         }
-        self.advance_chunk(chunk_size).map(Some)
+        // Run as many whole chunks as are buffered, up to the batch cap, in
+        // a single fused encoder pass. The block-causal mask inside the
+        // encoder makes this byte-identical to processing them one at a time.
+        let full_chunks = (ready / chunk_size).min(self.max_chunk_batch);
+        self.advance_chunk(full_chunks * chunk_size).map(Some)
     }
 
     fn advance_chunk(&mut self, len: usize) -> Result<Vec<u32>> {
