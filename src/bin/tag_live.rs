@@ -22,6 +22,7 @@
 //! origins — estimate the constant offset (echo delay / first-match) to align.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -98,6 +99,18 @@ struct Args {
     /// turn). The drop is logged. 1 = send everything.
     #[arg(long, default_value_t = 2)]
     min_words: usize,
+    /// Append every event (mic/ref words, dup verdicts, agent sends, drops,
+    /// delay adaptations) to this transcript file, plain text, for offline
+    /// analysis without screen-scraping. Truncated at start.
+    #[arg(long)]
+    log_file: Option<std::path::PathBuf>,
+}
+
+/// Write a plain transcript line (no ANSI) to the log file if one is open.
+fn logln(f: &mut Option<std::fs::File>, line: &str) {
+    if let Some(file) = f {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn pick_device(cpu: bool) -> Device {
@@ -273,20 +286,28 @@ fn phonetic(w: &str) -> String {
 }
 
 /// Send the grouped USER utterance to the agent, or drop it if too short.
-fn flush_user(buf: &mut Vec<String>, min_words: usize, sock: &Option<UdpSocket>, addr: &Option<String>) {
+fn flush_user(
+    buf: &mut Vec<String>,
+    min_words: usize,
+    sock: &Option<UdpSocket>,
+    addr: &Option<String>,
+    log: &mut Option<std::fs::File>,
+) {
     if buf.is_empty() {
         return;
     }
+    let utt = buf.join(" ");
     if buf.len() < min_words {
-        eprintln!("{DIM}-- dropped short utterance: '{}'{RST}", buf.join(" "));
+        eprintln!("{DIM}-- dropped short utterance: '{utt}'{RST}");
+        logln(log, &format!("DROP\t{utt}"));
         buf.clear();
         return;
     }
     if let (Some(s), Some(a)) = (sock, addr) {
-        let utt = buf.join(" ");
         let _ = s.send_to(utt.as_bytes(), a);
-        eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
     }
+    eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
+    logln(log, &format!("AGENT\t{utt}"));
     buf.clear();
 }
 
@@ -433,6 +454,14 @@ fn main() -> Result<()> {
         Some(_) => Some(UdpSocket::bind("0.0.0.0:0")?),
         None => None,
     };
+    let mut log_file = match &args.log_file {
+        Some(p) => {
+            let f = std::fs::File::create(p).with_context(|| format!("creating log file {}", p.display()))?;
+            eprintln!("tag_live: transcript -> {}", p.display());
+            Some(f)
+        }
+        None => None,
+    };
     eprintln!("tag_live: mic {} | ref {} | {GREEN}USER{RST}/{RED}ECHO{RST}\n", args.mic_listen, args.ref_listen);
 
     let mut ref_recent: VecDeque<(String, f32)> = VecDeque::new();
@@ -460,6 +489,7 @@ fn main() -> Result<()> {
         match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(Msg::Ref(w, abs)) => {
                 println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
+                logln(&mut log_file, &format!("REF\t{:.0}\t{w}", abs));
                 ref_recent.push_back((w, abs));
             }
             Ok(Msg::RefProgress(abs)) => {
@@ -470,6 +500,7 @@ fn main() -> Result<()> {
             Ok(Msg::Mic(w, abs)) => {
                 // Stage 1 — raw ASR, printed the instant the word appears.
                 println!("{GREEN}[mic ]{RST} {:>7.1}s  {w}", abs / 1000.0);
+                logln(&mut log_file, &format!("MIC\t{:.0}\t{w}", abs));
                 pending_mic.push_back((w, abs, Instant::now()));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -534,13 +565,10 @@ fn main() -> Result<()> {
                 delay_n += 1;
                 delay_ema = if delay_n == 1 { best_dt } else { 0.9 * delay_ema + 0.1 * best_dt };
                 if delay_n == args.delay_adapt_after || (delay_n > args.delay_adapt_after && delay_n % 25 == 0) {
-                    eprintln!(
-                        "{DIM}~~ echo delay avg {:.0}ms -> window [{:.0},{:.0}]ms (n={}){RST}",
-                        delay_ema,
-                        (delay_ema - args.delay_half_ms as f32).max(0.0),
-                        delay_ema + args.delay_half_ms as f32,
-                        delay_n
-                    );
+                    let lo = (delay_ema - args.delay_half_ms as f32).max(0.0);
+                    let hi = delay_ema + args.delay_half_ms as f32;
+                    eprintln!("{DIM}~~ echo delay avg {delay_ema:.0}ms -> window [{lo:.0},{hi:.0}]ms (n={delay_n}){RST}");
+                    logln(&mut log_file, &format!("DELAY\t{delay_ema:.0}\t{lo:.0}\t{hi:.0}\t{delay_n}"));
                 }
             }
             let (col, tag) = if is_echo { (RED, "ECHO") } else { (GREEN, "USER") };
@@ -549,6 +577,7 @@ fn main() -> Result<()> {
                 "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
                 t / 1000.0, best.0, best.1
             );
+            logln(&mut log_file, &format!("DUP\t{:.0}\t{w}\t{tag}\t{}\t{:.2}\t{:.0}", t, best.0, best.1, best_dt));
             // Only forward real words to the agent — skip standalone punctuation
             // tokens (".", "?", …) the ASR emits, which otherwise become junk
             // one-token utterances that trigger spurious turns.
@@ -561,7 +590,7 @@ fn main() -> Result<()> {
                     // Word-gap split: a USER word whose audio time jumps >flush_ms
                     // past the last one starts a new utterance — flush first.
                     if !user_buf.is_empty() && t - last_user_abs > flush_gap {
-                        flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out);
+                        flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out, &mut log_file);
                     }
                     user_buf.push(w.clone());
                     last_user_abs = t;
@@ -572,7 +601,7 @@ fn main() -> Result<()> {
         // Idle flush: the mic has decoded flush_ms past the last USER word with
         // nothing new (the user stopped) — send the grouped utterance.
         if !user_buf.is_empty() && mic_processed_ms - last_user_abs >= flush_gap {
-            flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out);
+            flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out, &mut log_file);
         }
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
