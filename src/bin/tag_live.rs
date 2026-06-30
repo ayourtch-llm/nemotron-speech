@@ -330,7 +330,7 @@ fn flush_user(
     let utt = buf.join(" ");
     if buf.len() < min_words {
         eprintln!("{DIM}-- dropped short utterance: '{utt}'{RST}");
-        logln(log, &format!("DROP\t{utt}"));
+        logln(log, &format!("-- dropped short utterance: '{utt}'"));
         buf.clear();
         return;
     }
@@ -338,7 +338,7 @@ fn flush_user(
         let _ = s.send_to(utt.as_bytes(), a);
     }
     eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
-    logln(log, &format!("AGENT\t{utt}"));
+    logln(log, &format!("-> agent: {utt}"));
     buf.clear();
 }
 
@@ -525,7 +525,7 @@ fn main() -> Result<()> {
         match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(Msg::Ref(w, abs)) => {
                 println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
-                logln(&mut log_file, &format!("REF\t{:.0}\t{w}", abs));
+                logln(&mut log_file, &format!("[ref ] {:>7.1}s  {w}", abs / 1000.0));
                 last_activity = Instant::now(); // a reference word = active turn
                 ref_recent.push_back((w, abs));
             }
@@ -537,7 +537,7 @@ fn main() -> Result<()> {
             Ok(Msg::Mic(w, abs)) => {
                 // Stage 1 — raw ASR, printed the instant the word appears.
                 println!("{GREEN}[mic ]{RST} {:>7.1}s  {w}", abs / 1000.0);
-                logln(&mut log_file, &format!("MIC\t{:.0}\t{w}", abs));
+                logln(&mut log_file, &format!("[mic ] {:>7.1}s  {w}", abs / 1000.0));
                 last_activity = Instant::now();
                 mic_armed = true; // a mic word means the device mic is streaming
                 pending_mic.push_back((w, abs, Instant::now()));
@@ -607,7 +607,7 @@ fn main() -> Result<()> {
                     let lo = (delay_ema - args.delay_half_ms as f32).max(0.0);
                     let hi = delay_ema + args.delay_half_ms as f32;
                     eprintln!("{DIM}~~ echo delay avg {delay_ema:.0}ms -> window [{lo:.0},{hi:.0}]ms (n={delay_n}){RST}");
-                    logln(&mut log_file, &format!("DELAY\t{delay_ema:.0}\t{lo:.0}\t{hi:.0}\t{delay_n}"));
+                    logln(&mut log_file, &format!("~~ echo delay avg {delay_ema:.0}ms -> window [{lo:.0},{hi:.0}]ms (n={delay_n})"));
                 }
             }
             let (col, tag) = if is_echo { (RED, "ECHO") } else { (GREEN, "USER") };
@@ -616,7 +616,7 @@ fn main() -> Result<()> {
                 "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
                 t / 1000.0, best.0, best.1
             );
-            logln(&mut log_file, &format!("DUP\t{:.0}\t{w}\t{tag}\t{}\t{:.2}\t{:.0}", t, best.0, best.1, best_dt));
+            logln(&mut log_file, &format!("[dup ] {:>7.1}s  {w:<14} {tag} (ref~'{}' {:.2} dt={:.0})", t / 1000.0, best.0, best.1, best_dt));
             // Only forward real words to the agent — skip standalone punctuation
             // tokens (".", "?", …) the ASR emits, which otherwise become junk
             // one-token utterances that trigger spurious turns.
@@ -647,7 +647,7 @@ fn main() -> Result<()> {
         if let Some(ctl) = &args.device_ctl {
             if mic_armed && now.duration_since(last_activity) >= idle {
                 eprintln!("{DIM}-- mic idle {}s -> closing device mic{RST}", args.idle_secs);
-                logln(&mut log_file, &format!("IDLE\tasrstream 0 ({}s)", args.idle_secs));
+                logln(&mut log_file, &format!("-- mic idle {}s -> closing device mic", args.idle_secs));
                 device_cmd(ctl, "asrstream 0");
                 mic_armed = false;
             }
