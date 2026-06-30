@@ -69,9 +69,31 @@ fn main() -> Result<()> {
     }
     let one_b2 = t0.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    println!("2× batch-1 (separate): {two_b1:.1} ms/iter");
-    println!("1× batch-2 (shared):   {one_b2:.1} ms/iter");
-    println!("speedup from batching: {:.2}×", two_b1 / one_b2);
+    // 2× batch-1 on TWO THREADS (the parallelism-across-cores hypothesis).
+    let enc = std::sync::Arc::new(encoder);
+    let two_par = {
+        let t0 = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let enc = enc.clone();
+            let mel = mel1.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..iters {
+                    let a = enc.forward_full(&mel, false).unwrap();
+                    let _ = a.to_vec3::<f32>().unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        t0.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    };
+
+    println!("2× batch-1 (sequential): {two_b1:.1} ms/iter");
+    println!("2× batch-1 (2 threads):  {two_par:.1} ms/iter   <- parallelism across cores");
+    println!("1× batch-2 (shared):     {one_b2:.1} ms/iter");
+    println!("threading speedup: {:.2}×   batching speedup: {:.2}×", two_b1 / two_par, two_b1 / one_b2);
     let chunk_s = frames as f64 / 100.0;
     println!(
         "batch-2 throughput: {:.1}× realtime for TWO streams ({:.0} ms compute per {:.2}s of audio×2)",
