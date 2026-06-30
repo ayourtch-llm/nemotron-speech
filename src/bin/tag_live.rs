@@ -1,26 +1,33 @@
 //! tag_live — dual-stream speaker-attributed ASR for the Nabu voice loop.
 //!
-//! Transcribes BOTH RTP streams at once on the same engine/clock:
-//!   - the MIC   (near end: user + residual TTS echo)   on --mic-listen
-//!   - the TTS REFERENCE (the echo's source)            on --ref-listen
-//! then tags each mic word USER vs ECHO by matching it against the reference
-//! words in TIME (echo lags the reference by ~delay) AND CONTENT (fuzzy). The
-//! live view prints both ASR streams color-coded + the per-word tag, and only
-//! USER words are forwarded to the agent (--text-out).
+//! Transcribes BOTH RTP streams at once (mic on --mic-listen, the TTS reference
+//! on --ref-listen) and tags each mic word USER vs ECHO by matching it against
+//! the reference words in TIME (echo lags the reference by ~delay) AND CONTENT
+//! (fuzzy). Live color-coded view; USER words forwarded to the agent (--text-out).
 //!
-//! The reference stream is the EASY case (clean audio) with a relaxed latency
-//! budget (its echo doesn't reach the mic until ~delay later), so it runs at a
-//! larger chunk-batch than the mic.
+//! Each stream runs its own StreamingPipeline on its OWN OS THREAD, so the two
+//! ASRs use separate CPU cores (measured ~1.78× vs serial; batching the two into
+//! one forward is *slower* on CPU — see bench_batch). The main thread does the
+//! lightweight matching.
+//!
+//! KNOWN LIMITATION (timing): a word's time = stream-start offset + pipeline
+//! frame-time — accurate for the continuous mic but it DRIFTS for the reference
+//! across TTS silence gaps, and the streaming chunked path can fall behind
+//! real-time, so per-word USER/ECHO tagging is currently partial (~50% echo
+//! recall on the faithful replay). The mechanism is correct (aligned pairs tag
+//! perfectly); the open work is a processing-lag-immune audio clock (RTP
+//! timestamp based) + cross-stream sync. See handoff "tag_live timing".
 
 use std::collections::VecDeque;
+use std::net::UdpSocket;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use clap::Parser;
-use tokio::net::UdpSocket;
 
-use nemotron_speech::audio_source::{AudioSource, UdpSource};
 use nemotron_speech::features::{IncrementalMelExtractor, MelConfig};
 use nemotron_speech::model::encoder::FastConformerEncoder;
 use nemotron_speech::model::joint::JointNet;
@@ -29,7 +36,7 @@ use nemotron_speech::model::ModelConfig;
 use nemotron_speech::streaming::StreamingPipeline;
 use nemotron_speech::tokenizer::Tokenizer;
 
-const FRAME_MS: f32 = 80.0; // encoder stride: mel hop 10ms × subsample 8
+const FRAME_MS: f32 = 80.0;
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const DIM: &str = "\x1b[2m";
@@ -43,10 +50,8 @@ struct Args {
     st: std::path::PathBuf,
     #[arg(long)]
     tok: std::path::PathBuf,
-    /// Near-end mic RTP/L16 (point rtp-aec --asr-out2 here).
     #[arg(long, default_value = "0.0.0.0:9992")]
     mic_listen: String,
-    /// TTS reference RTP/L16 (point rtp-aec --ref-out2 here).
     #[arg(long, default_value = "0.0.0.0:9993")]
     ref_listen: String,
     /// Forward USER-tagged words to this UDP target (the agent). Unset = print only.
@@ -54,19 +59,17 @@ struct Args {
     text_out: Option<String>,
     #[arg(long, default_value_t = false)]
     cpu: bool,
-    /// Encoder chunk fusion for the mic (low latency = small).
     #[arg(long, default_value_t = 2)]
     chunk_batch: usize,
-    /// Encoder chunk fusion for the reference (relaxed latency = large).
-    #[arg(long, default_value_t = 8)]
-    ref_chunk_batch: usize,
-    /// Echo lags the reference by [delay_lo, delay_hi] ms (the match window).
     #[arg(long, default_value_t = 50)]
     delay_lo_ms: i64,
-    #[arg(long, default_value_t = 950)]
+    #[arg(long, default_value_t = 1100)]
     delay_hi_ms: i64,
     #[arg(long, default_value_t = 0.55)]
     fuzzy_thr: f32,
+    /// Max ms a mic word waits for the reference before committing its tag.
+    #[arg(long, default_value_t = 1500)]
+    hold_ms: u64,
 }
 
 fn pick_device(cpu: bool) -> Device {
@@ -77,17 +80,13 @@ fn pick_device(cpu: bool) -> Device {
     {
         Device::new_metal(0).unwrap_or(Device::Cpu)
     }
-    #[cfg(all(feature = "cuda", not(feature = "metal")))]
-    {
-        Device::new_cuda(0).unwrap_or(Device::Cpu)
-    }
-    #[cfg(not(any(feature = "metal", feature = "cuda")))]
+    #[cfg(not(feature = "metal"))]
     {
         Device::Cpu
     }
 }
 
-fn build_pipeline(st: &std::path::Path, device: &Device, dtype: DType) -> Result<StreamingPipeline> {
+fn build_pipeline(st: &std::path::Path, device: &Device, dtype: DType, batch: usize) -> Result<StreamingPipeline> {
     let mel_cfg = MelConfig::nemotron_default();
     let mel = IncrementalMelExtractor::from_safetensors(st, mel_cfg.clone())?;
     let vb = unsafe {
@@ -98,11 +97,33 @@ fn build_pipeline(st: &std::path::Path, device: &Device, dtype: DType) -> Result
         .map_err(|e| anyhow::anyhow!("encoder: {e:#}"))?;
     let predict = PredictNet::new(vb.pp("predict"), &cfg).map_err(|e| anyhow::anyhow!("predict: {e:#}"))?;
     let joint = JointNet::new(vb.pp("joint"), &cfg).map_err(|e| anyhow::anyhow!("joint: {e:#}"))?;
-    StreamingPipeline::new(encoder, predict, joint, mel, mel_cfg, cfg, device.clone(), dtype)
+    let mut p = StreamingPipeline::new(encoder, predict, joint, mel, mel_cfg, cfg, device.clone(), dtype)?;
+    p.set_max_chunk_batch(batch);
+    Ok(p)
 }
 
-/// Groups a stream's tokens into words with start timestamps. Holds only the
-/// in-progress word's tokens (emits a word when the next word starts).
+/// Parse an RTP/L16 datagram (12-byte header, 16-bit BE PCM) to f32 samples.
+fn parse_l16(buf: &[u8]) -> Vec<f32> {
+    if buf.len() < 14 || (buf[0] >> 6) != 2 {
+        return Vec::new();
+    }
+    let cc = (buf[0] & 0x0f) as usize;
+    let mut hdr = 12 + cc * 4;
+    if buf[0] & 0x10 != 0 && buf.len() >= hdr + 4 {
+        let words = ((buf[hdr + 2] as usize) << 8) | buf[hdr + 3] as usize;
+        hdr += 4 + words * 4;
+    }
+    if buf.len() <= hdr {
+        return Vec::new();
+    }
+    let n = (buf.len() - hdr) / 2;
+    (0..n)
+        .map(|i| i16::from_be_bytes([buf[hdr + i * 2], buf[hdr + i * 2 + 1]]) as f32 / 32768.0)
+        .collect()
+}
+
+/// Groups a stream's tokens into words with start timestamps (in-progress word
+/// held until the next word starts).
 struct WordGrouper {
     tok: Tokenizer,
     buf_tokens: Vec<u32>,
@@ -114,16 +135,14 @@ impl WordGrouper {
         Self { tok, buf_tokens: Vec::new(), buf_frames: Vec::new() }
     }
 
-    /// Feed newly decoded (token, frame) pairs; return any words that completed.
     fn push(&mut self, new_tokens: &[u32], new_frames: &[usize]) -> Vec<(String, f32)> {
         self.buf_tokens.extend_from_slice(new_tokens);
         self.buf_frames.extend_from_slice(new_frames);
         let mut words = Vec::new();
-        // Re-derive word boundaries over the (small) buffer via prefix-decode.
         let mut prev = String::new();
         let mut cur = String::new();
         let mut cur_start = 0.0f32;
-        let mut completed_upto = 0usize; // token index where the last completed word ended
+        let mut completed_upto = 0usize;
         for i in 0..self.buf_tokens.len() {
             let full = self.tok.detokenize(&self.buf_tokens[0..=i]).unwrap_or_default();
             let added = if full.len() >= prev.len() { full[prev.len()..].to_string() } else { full.clone() };
@@ -131,7 +150,7 @@ impl WordGrouper {
             let starts = added.starts_with(' ') || (cur.trim().is_empty() && !added.trim().is_empty());
             if starts && !cur.trim().is_empty() {
                 words.push((cur.trim().to_string(), cur_start));
-                completed_upto = i; // the completed word ends here; drain up to the new word's first token
+                completed_upto = i;
                 cur.clear();
             }
             if cur.trim().is_empty() {
@@ -140,7 +159,6 @@ impl WordGrouper {
             cur.push_str(&added);
             prev = full;
         }
-        // Drop tokens of fully-completed words; keep the in-progress word.
         if completed_upto > 0 {
             self.buf_tokens.drain(0..completed_upto);
             self.buf_frames.drain(0..completed_upto);
@@ -153,7 +171,6 @@ fn norm(w: &str) -> String {
     w.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
 }
 
-/// Fuzzy content match (same rules as tools/echo_match.py).
 fn fuzzy(a: &str, b: &str) -> f32 {
     let (a, b) = (norm(a), norm(b));
     if a.is_empty() || b.is_empty() {
@@ -164,7 +181,7 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     }
     let (sh, lo) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
     if sh.len() >= 2 && (lo.starts_with(sh.as_str()) || lo.ends_with(sh.as_str())) {
-        return 0.9; // tokenization merge/split across the two ASR passes
+        return 0.9;
     }
     if lo.contains(sh.as_str()) {
         return sh.len() as f32 / lo.len() as f32;
@@ -174,113 +191,125 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     shared as f32 / a.len().max(b.len()) as f32
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// A word emitted by a stream worker, on the common (offset + frame-time) axis.
+enum Msg {
+    Ref(String, f32),
+    Mic(String, f32),
+}
+
+/// One stream worker: blocking UDP recv → pipeline (silence-padded) → words → tx.
+fn run_stream(
+    is_mic: bool,
+    listen: String,
+    st: std::path::PathBuf,
+    tok: std::path::PathBuf,
+    device: Device,
+    batch: usize,
+    prog_start: Instant,
+    tx: mpsc::Sender<Msg>,
+) -> Result<()> {
+    let sock = UdpSocket::bind(&listen).with_context(|| format!("binding {listen}"))?;
+    let mut pipe = build_pipeline(&st, &device, DType::F32, batch)?;
+    let mut grouper = WordGrouper::new(Tokenizer::from_file(&tok)?);
+    let mut start: Option<Instant> = None;
+    let mut last_recv: Option<Instant> = None;
+    let mut pushed: usize = 0;
+    let mut buf = vec![0u8; 65_536];
+    loop {
+        let n = match sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let samples = parse_l16(&buf[..n]);
+        if samples.is_empty() {
+            continue;
+        }
+        let now = Instant::now();
+        let s0 = *start.get_or_insert(now);
+        let off = s0.duration_since(prog_start).as_millis() as f32;
+        let _ = (&mut last_recv, &mut pushed);
+        // NOTE: word abs time = stream-start offset + pipeline frame-time. This
+        // is accurate for the continuous mic but DRIFTS for the reference across
+        // its TTS silence gaps (frame-time counts only received audio). Wall-clock
+        // silence-padding to compensate proved fragile — once the streaming path
+        // falls behind real-time, wall-clock-derived timing inflates. The correct
+        // fix is an RTP-timestamp-based audio clock (immune to processing lag) +
+        // cross-stream sync; left for a focused pass. See handoff "tag_live timing".
+        pipe.push_audio(&samples);
+        pushed += samples.len();
+        while let Some(toks) = pipe.try_advance()? {
+            if toks.is_empty() {
+                continue;
+            }
+            let prev = pipe.all_tokens.len() - toks.len();
+            let frames = pipe.all_frames[prev..].to_vec();
+            for (w, t) in grouper.push(&toks, &frames) {
+                let msg = if is_mic { Msg::Mic(w, off + t) } else { Msg::Ref(w, off + t) };
+                if tx.send(msg).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
     let device = pick_device(args.cpu);
-    let dtype = DType::F32;
     eprintln!("tag_live: device {:?}", device);
 
-    let mut mic_pipe = build_pipeline(&args.st, &device, dtype)?;
-    mic_pipe.set_max_chunk_batch(args.chunk_batch);
-    let mut ref_pipe = build_pipeline(&args.st, &device, dtype)?;
-    ref_pipe.set_max_chunk_batch(args.ref_chunk_batch);
-    let mut mic_words = WordGrouper::new(Tokenizer::from_file(&args.tok)?);
-    let mut ref_words = WordGrouper::new(Tokenizer::from_file(&args.tok)?);
-    eprintln!("tag_live: loaded 2 pipelines (mic batch {}, ref batch {})", args.chunk_batch, args.ref_chunk_batch);
+    let prog_start = Instant::now();
+    let (tx, rx) = mpsc::channel::<Msg>();
 
-    let mut mic_src = UdpSource::bind(&args.mic_listen, 320).await?;
-    let mut ref_src = UdpSource::bind(&args.ref_listen, 320).await?;
-    eprintln!("tag_live: mic {} | ref {}", args.mic_listen, args.ref_listen);
+    // One OS thread per stream → true parallelism across cores.
+    {
+        let (st, tok, dev, tx) = (args.st.clone(), args.tok.clone(), device.clone(), tx.clone());
+        let listen = args.ref_listen.clone();
+        let b = args.chunk_batch;
+        std::thread::spawn(move || {
+            if let Err(e) = run_stream(false, listen, st, tok, dev, b, prog_start, tx) {
+                eprintln!("ref worker died: {e:#}");
+            }
+        });
+    }
+    {
+        let (st, tok, dev) = (args.st.clone(), args.tok.clone(), device.clone());
+        let listen = args.mic_listen.clone();
+        let b = args.chunk_batch;
+        std::thread::spawn(move || {
+            if let Err(e) = run_stream(true, listen, st, tok, dev, b, prog_start, tx) {
+                eprintln!("mic worker died: {e:#}");
+            }
+        });
+    }
 
     let out_sock = match &args.text_out {
-        Some(_) => Some(UdpSocket::bind("0.0.0.0:0").await?),
+        Some(_) => Some(UdpSocket::bind("0.0.0.0:0")?),
         None => None,
     };
+    eprintln!("tag_live: mic {} | ref {} | {GREEN}USER{RST}/{RED}ECHO{RST}\n", args.mic_listen, args.ref_listen);
 
-    // Recent reference words (audio time), the in-flight mic words awaiting a
-    // verdict, the newest reference audio-time seen, and when reference audio
-    // last flowed (to tell "TTS silent" from "reference ASR just lagging").
     let mut ref_recent: VecDeque<(String, f32)> = VecDeque::new();
-    let mut pending_mic: VecDeque<(String, f32, std::time::Instant)> = VecDeque::new();
+    let mut pending_mic: VecDeque<(String, f32, Instant)> = VecDeque::new();
     let mut ref_latest_ms: f32 = 0.0;
-    let mut last_ref_audio: Option<std::time::Instant> = None;
-    // Common time axis: a word's abs time = (its stream's start offset) +
-    // frame-time. To keep frame-time == wall-clock through the reference's
-    // silence gaps (TTS pauses send no packets), each stream is padded with
-    // zeros so its total pushed samples track real-time elapsed. Then both
-    // streams' abs times are comparable and the echo lands ~delay after its ref.
-    let prog_start = std::time::Instant::now();
-    let mut mic_start: Option<std::time::Instant> = None;
-    let mut ref_start: Option<std::time::Instant> = None;
-    let mut mic_pushed: usize = 0;
-    let mut ref_pushed: usize = 0;
-    // Max wall-clock a mic word waits for the reference to catch up before we
-    // commit its tag (covers the no-echo case where the reference never advances).
-    let hold = std::time::Duration::from_millis(1500);
-    let mut drain_timer = tokio::time::interval(std::time::Duration::from_millis(40));
-    drain_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    eprintln!("tag_live: live. {GREEN}USER{RST} / {RED}ECHO{RST}\n");
+    let mut last_ref_word = Instant::now();
+    let hold = Duration::from_millis(args.hold_ms);
 
     loop {
-        tokio::select! {
-            r = ref_src.next_chunk() => {
-                let Some(chunk) = r? else { break };
-                let now = std::time::Instant::now();
-                last_ref_audio = Some(now);
-                let rs = *ref_start.get_or_insert(now);
-                let off = rs.duration_since(prog_start).as_millis() as f32;
-                // Pad silence so pushed samples track real-time (handles TTS gaps).
-                let target = now.duration_since(rs).as_millis() as usize * 16;
-                if target > ref_pushed + chunk.samples.len() {
-                    let pad = target - ref_pushed - chunk.samples.len();
-                    ref_pipe.push_audio(&vec![0.0f32; pad]);
-                    ref_pushed += pad;
-                }
-                ref_pipe.push_audio(&chunk.samples);
-                ref_pushed += chunk.samples.len();
-                while let Some(toks) = ref_pipe.try_advance()? {
-                    if toks.is_empty() { continue; }
-                    let prev = ref_pipe.all_tokens.len() - toks.len();
-                    let frames = ref_pipe.all_frames[prev..].to_vec();
-                    for (w, t) in ref_words.push(&toks, &frames) {
-                        let abs = off + t;
-                        println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
-                        ref_latest_ms = ref_latest_ms.max(abs);
-                        ref_recent.push_back((w, abs));
-                    }
-                }
+        match rx.recv_timeout(Duration::from_millis(40)) {
+            Ok(Msg::Ref(w, abs)) => {
+                println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
+                ref_latest_ms = ref_latest_ms.max(abs);
+                last_ref_word = Instant::now();
+                ref_recent.push_back((w, abs));
             }
-            m = mic_src.next_chunk() => {
-                let Some(chunk) = m? else { break };
-                let now = std::time::Instant::now();
-                let ms = *mic_start.get_or_insert(now);
-                let off = ms.duration_since(prog_start).as_millis() as f32;
-                let target = now.duration_since(ms).as_millis() as usize * 16;
-                if target > mic_pushed + chunk.samples.len() {
-                    let pad = target - mic_pushed - chunk.samples.len();
-                    mic_pipe.push_audio(&vec![0.0f32; pad]);
-                    mic_pushed += pad;
-                }
-                mic_pipe.push_audio(&chunk.samples);
-                mic_pushed += chunk.samples.len();
-                while let Some(toks) = mic_pipe.try_advance()? {
-                    if toks.is_empty() { continue; }
-                    let prev = mic_pipe.all_tokens.len() - toks.len();
-                    let frames = mic_pipe.all_frames[prev..].to_vec();
-                    for (w, t) in mic_words.push(&toks, &frames) {
-                        pending_mic.push_back((w, off + t, now));
-                    }
-                }
-            }
-            _ = drain_timer.tick() => {}
+            Ok(Msg::Mic(w, abs)) => pending_mic.push_back((w, abs, Instant::now())),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Commit any pending mic words whose verdict is now decidable: the
-        // reference has advanced past the latest possible echo source for that
-        // word, OR TTS is silent, OR the wait timed out.
-        let now = std::time::Instant::now();
-        let tts_active = last_ref_audio.map(|i| now.duration_since(i).as_millis() < 300).unwrap_or(false);
+        let now = Instant::now();
+        let tts_active = now.duration_since(last_ref_word).as_millis() < 600;
         while let Some((w, t, arrived)) = pending_mic.front().cloned() {
             let ref_caught_up = ref_latest_ms >= t - args.delay_lo_ms as f32;
             let timed_out = now.duration_since(arrived) >= hold;
@@ -306,12 +335,11 @@ async fn main() -> Result<()> {
             );
             if !is_echo {
                 if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
-                    let _ = sock.send_to(format!("{w} ").as_bytes(), addr).await;
+                    let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
                 }
             }
         }
 
-        // Prune reference words older than the match window needs.
         let horizon = (args.delay_hi_ms + 4000) as f32;
         while let Some((_, rt)) = ref_recent.front() {
             if ref_latest_ms - rt > horizon {
