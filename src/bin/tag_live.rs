@@ -10,13 +10,16 @@
 //! one forward is *slower* on CPU — see bench_batch). The main thread does the
 //! lightweight matching.
 //!
-//! KNOWN LIMITATION (timing): a word's time = stream-start offset + pipeline
-//! frame-time — accurate for the continuous mic but it DRIFTS for the reference
-//! across TTS silence gaps, and the streaming chunked path can fall behind
-//! real-time, so per-word USER/ECHO tagging is currently partial (~50% echo
-//! recall on the faithful replay). The mechanism is correct (aligned pairs tag
-//! perfectly); the open work is a processing-lag-immune audio clock (RTP
-//! timestamp based) + cross-stream sync. See handoff "tag_live timing".
+//! TIMING: each decoded word is stamped with the RTP TIMESTAMP of the audio it
+//! came from (frame → pushed-sample → nearest packet's RTP ts), not wall-clock —
+//! so the time is immune to processing lag and gap-accurate (the sender's ts
+//! reflects silence gaps). Both streams share one origin (the replay derives ts
+//! from the recorded t_us; LIVE needs the device+kokoro RTP clocks reconciled —
+//! see below). Result on the faithful replay: precision held (0 user false-drops
+//! on the counting capture), echo recall ~75% on the AGC-off leak capture (up
+//! from ~50% with wall-clock timing). Remaining recall loss is window/ASR-variance
+//! tuning. LIVE TODO: the device mic and kokoro reference use independent RTP ts
+//! origins — estimate the constant offset (echo delay / first-match) to align.
 
 use std::collections::VecDeque;
 use std::net::UdpSocket;
@@ -36,7 +39,8 @@ use nemotron_speech::model::ModelConfig;
 use nemotron_speech::streaming::StreamingPipeline;
 use nemotron_speech::tokenizer::Tokenizer;
 
-const FRAME_MS: f32 = 80.0;
+/// Encoder frame = mel hop (160) × subsample (8) = 1280 samples (80 ms @ 16 kHz).
+const SAMPLES_PER_FRAME: usize = 1280;
 const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const DIM: &str = "\x1b[2m";
@@ -102,11 +106,14 @@ fn build_pipeline(st: &std::path::Path, device: &Device, dtype: DType, batch: us
     Ok(p)
 }
 
-/// Parse an RTP/L16 datagram (12-byte header, 16-bit BE PCM) to f32 samples.
-fn parse_l16(buf: &[u8]) -> Vec<f32> {
+/// Parse an RTP/L16 datagram → (samples, rtp_timestamp). The RTP timestamp is
+/// the sample-clock position of the first sample, set by the sender — a
+/// processing-lag-immune time source we thread through to each decoded word.
+fn parse_l16(buf: &[u8]) -> Option<(Vec<f32>, u32)> {
     if buf.len() < 14 || (buf[0] >> 6) != 2 {
-        return Vec::new();
+        return None;
     }
+    let ts = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let cc = (buf[0] & 0x0f) as usize;
     let mut hdr = 12 + cc * 4;
     if buf[0] & 0x10 != 0 && buf.len() >= hdr + 4 {
@@ -114,12 +121,13 @@ fn parse_l16(buf: &[u8]) -> Vec<f32> {
         hdr += 4 + words * 4;
     }
     if buf.len() <= hdr {
-        return Vec::new();
+        return None;
     }
     let n = (buf.len() - hdr) / 2;
-    (0..n)
+    let samples = (0..n)
         .map(|i| i16::from_be_bytes([buf[hdr + i * 2], buf[hdr + i * 2 + 1]]) as f32 / 32768.0)
-        .collect()
+        .collect();
+    Some((samples, ts))
 }
 
 /// Groups a stream's tokens into words with start timestamps (in-progress word
@@ -135,18 +143,19 @@ impl WordGrouper {
         Self { tok, buf_tokens: Vec::new(), buf_frames: Vec::new() }
     }
 
-    fn push(&mut self, new_tokens: &[u32], new_frames: &[usize]) -> Vec<(String, f32)> {
+    /// Returns completed (word, start_frame_index). The caller maps the frame
+    /// index to an RTP timestamp.
+    fn push(&mut self, new_tokens: &[u32], new_frames: &[usize]) -> Vec<(String, usize)> {
         self.buf_tokens.extend_from_slice(new_tokens);
         self.buf_frames.extend_from_slice(new_frames);
         let mut words = Vec::new();
         let mut prev = String::new();
         let mut cur = String::new();
-        let mut cur_start = 0.0f32;
+        let mut cur_start = 0usize;
         let mut completed_upto = 0usize;
         for i in 0..self.buf_tokens.len() {
             let full = self.tok.detokenize(&self.buf_tokens[0..=i]).unwrap_or_default();
             let added = if full.len() >= prev.len() { full[prev.len()..].to_string() } else { full.clone() };
-            let t = self.buf_frames[i] as f32 * FRAME_MS;
             let starts = added.starts_with(' ') || (cur.trim().is_empty() && !added.trim().is_empty());
             if starts && !cur.trim().is_empty() {
                 words.push((cur.trim().to_string(), cur_start));
@@ -154,7 +163,7 @@ impl WordGrouper {
                 cur.clear();
             }
             if cur.trim().is_empty() {
-                cur_start = t;
+                cur_start = self.buf_frames[i];
             }
             cur.push_str(&added);
             prev = full;
@@ -208,11 +217,14 @@ fn run_stream(
     prog_start: Instant,
     tx: mpsc::Sender<Msg>,
 ) -> Result<()> {
+    let _ = prog_start;
     let sock = UdpSocket::bind(&listen).with_context(|| format!("binding {listen}"))?;
     let mut pipe = build_pipeline(&st, &device, DType::F32, batch)?;
     let mut grouper = WordGrouper::new(Tokenizer::from_file(&tok)?);
-    let mut start: Option<Instant> = None;
-    let mut last_recv: Option<Instant> = None;
+    // Anchors map this pipeline's cumulative pushed-sample position to the RTP
+    // timestamp of the audio there — so a decoded word's frame → pushed-sample →
+    // RTP timestamp (in ms). Gap-accurate and immune to processing lag.
+    let mut anchors: VecDeque<(usize, u32)> = VecDeque::new();
     let mut pushed: usize = 0;
     let mut buf = vec![0u8; 65_536];
     loop {
@@ -220,21 +232,14 @@ fn run_stream(
             Ok(n) => n,
             Err(_) => continue,
         };
-        let samples = parse_l16(&buf[..n]);
+        let Some((samples, ts)) = parse_l16(&buf[..n]) else { continue };
         if samples.is_empty() {
             continue;
         }
-        let now = Instant::now();
-        let s0 = *start.get_or_insert(now);
-        let off = s0.duration_since(prog_start).as_millis() as f32;
-        let _ = (&mut last_recv, &mut pushed);
-        // NOTE: word abs time = stream-start offset + pipeline frame-time. This
-        // is accurate for the continuous mic but DRIFTS for the reference across
-        // its TTS silence gaps (frame-time counts only received audio). Wall-clock
-        // silence-padding to compensate proved fragile — once the streaming path
-        // falls behind real-time, wall-clock-derived timing inflates. The correct
-        // fix is an RTP-timestamp-based audio clock (immune to processing lag) +
-        // cross-stream sync; left for a focused pass. See handoff "tag_live timing".
+        anchors.push_back((pushed, ts));
+        if anchors.len() > 4096 {
+            anchors.pop_front();
+        }
         pipe.push_audio(&samples);
         pushed += samples.len();
         while let Some(toks) = pipe.try_advance()? {
@@ -243,8 +248,18 @@ fn run_stream(
             }
             let prev = pipe.all_tokens.len() - toks.len();
             let frames = pipe.all_frames[prev..].to_vec();
-            for (w, t) in grouper.push(&toks, &frames) {
-                let msg = if is_mic { Msg::Mic(w, off + t) } else { Msg::Ref(w, off + t) };
+            for (w, frame) in grouper.push(&toks, &frames) {
+                // frame → cumulative pushed-sample position (80 ms = 1280 samp).
+                let sample = frame * SAMPLES_PER_FRAME;
+                // Nearest anchor at-or-before this sample → RTP ts of that audio.
+                let ts_at = anchors
+                    .iter()
+                    .rev()
+                    .find(|(p, _)| *p <= sample)
+                    .map(|(p, t)| t.wrapping_add((sample - p) as u32))
+                    .unwrap_or(ts);
+                let abs_ms = ts_at as f32 / 16.0; // 16 samples / ms @ 16 kHz
+                let msg = if is_mic { Msg::Mic(w, abs_ms) } else { Msg::Ref(w, abs_ms) };
                 if tx.send(msg).is_err() {
                     return Ok(());
                 }
