@@ -42,6 +42,10 @@ struct Args {
     /// full-attention path.
     #[arg(long, default_value_t = false)]
     chunked_mask: bool,
+    /// Emit per-word start timestamps (frame×80ms) as `WORD<TAB>START_MS` lines
+    /// under a `=== words ===` marker. Feeds the echo/user per-word tagger.
+    #[arg(long, default_value_t = false)]
+    word_timestamps: bool,
 }
 
 fn main() -> Result<()> {
@@ -140,8 +144,9 @@ fn main() -> Result<()> {
     // enc_out is (1, T, d_model). Squeeze batch.
     let enc_seq = enc_out.squeeze(0)?;
     let mut tokens: Vec<u32> = Vec::new();
+    let mut frames: Vec<usize> = Vec::new();
     let t0 = std::time::Instant::now();
-    dec.decode(&enc_seq, &predict, &joint, &mut tokens)?;
+    dec.decode_timed(&enc_seq, &predict, &joint, &mut tokens, &mut frames)?;
     println!(
         "greedy decode produced {} tokens in {:?}",
         tokens.len(),
@@ -153,5 +158,43 @@ fn main() -> Result<()> {
     let tok = Tokenizer::from_file(&args.tok)?;
     let text = tok.detokenize(&tokens)?;
     println!("\n=== transcription ===\n{}\n", text);
+
+    if args.word_timestamps {
+        // One encoder frame = mel hop (10 ms) × subsample (8) = 80 ms.
+        const FRAME_MS: f32 = 80.0;
+        // Group tokens into words via incremental prefix-decode: a token that
+        // adds a leading space (or the very first token) starts a new word; its
+        // start time is the frame at which it was emitted.
+        let mut words: Vec<(String, f32)> = Vec::new();
+        let mut prev = String::new();
+        let mut cur_word = String::new();
+        let mut cur_start = 0.0f32;
+        for i in 0..tokens.len() {
+            let full = tok.detokenize(&tokens[0..=i])?;
+            let added = if full.len() >= prev.len() {
+                full[prev.len()..].to_string()
+            } else {
+                full.clone()
+            };
+            let starts_word = added.starts_with(' ') || (cur_word.is_empty() && !added.trim().is_empty());
+            let t_ms = frames[i] as f32 * FRAME_MS;
+            if starts_word && !cur_word.trim().is_empty() {
+                words.push((cur_word.trim().to_string(), cur_start));
+                cur_word.clear();
+            }
+            if cur_word.trim().is_empty() {
+                cur_start = t_ms;
+            }
+            cur_word.push_str(&added);
+            prev = full;
+        }
+        if !cur_word.trim().is_empty() {
+            words.push((cur_word.trim().to_string(), cur_start));
+        }
+        println!("=== words ===");
+        for (w, t) in &words {
+            println!("{}\t{:.0}", w, t);
+        }
+    }
     Ok(())
 }

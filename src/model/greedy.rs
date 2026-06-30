@@ -28,6 +28,10 @@ pub struct GreedyDecoder {
     pub state: PredictState,
     pub blank_idx: usize,
     pub max_symbols: usize,
+    /// Cumulative encoder-frame index across `decode`/`decode_timed` calls, so
+    /// token timestamps stay correct across streaming chunks. One frame = the
+    /// encoder stride (mel hop 10 ms × subsample 8 = 80 ms).
+    pub base_frame: usize,
 }
 
 impl GreedyDecoder {
@@ -43,6 +47,7 @@ impl GreedyDecoder {
             state,
             blank_idx: cfg.blank_idx,
             max_symbols: cfg.max_symbols_per_step,
+            base_frame: 0,
         })
     }
 
@@ -55,6 +60,31 @@ impl GreedyDecoder {
         predict: &PredictNet,
         joint: &JointNet,
         out: &mut Vec<u32>,
+    ) -> Result<()> {
+        self.decode_impl(encoded, predict, joint, out, None)
+    }
+
+    /// Like `decode`, but also records the absolute encoder-frame index at which
+    /// each emitted token was produced (parallel to `out`). `frame × 80 ms` =
+    /// the token's start time. Used for per-word timestamps (echo/user tagging).
+    pub fn decode_timed(
+        &mut self,
+        encoded: &Tensor,
+        predict: &PredictNet,
+        joint: &JointNet,
+        out: &mut Vec<u32>,
+        frames: &mut Vec<usize>,
+    ) -> Result<()> {
+        self.decode_impl(encoded, predict, joint, out, Some(frames))
+    }
+
+    fn decode_impl(
+        &mut self,
+        encoded: &Tensor,
+        predict: &PredictNet,
+        joint: &JointNet,
+        out: &mut Vec<u32>,
+        mut frames: Option<&mut Vec<usize>>,
     ) -> Result<()> {
         let (t_frames, _d) = encoded.dims2()?;
         for t in 0..t_frames {
@@ -82,11 +112,15 @@ impl GreedyDecoder {
                 }
                 // Non-blank: emit, advance predictor state and last_token.
                 out.push(argmax as u32);
+                if let Some(fr) = frames.as_deref_mut() {
+                    fr.push(self.base_frame + t);
+                }
                 self.state = new_state;
                 self.last_token = Some(argmax);
                 symbols_added += 1;
             }
         }
+        self.base_frame += t_frames;
         Ok(())
     }
 }
