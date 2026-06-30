@@ -225,6 +225,19 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     shared as f32 / a.len().max(b.len()) as f32
 }
 
+/// Send the grouped USER utterance to the agent and clear the buffer.
+fn flush_user(buf: &mut Vec<String>, sock: &Option<UdpSocket>, addr: &Option<String>) {
+    if buf.is_empty() {
+        return;
+    }
+    if let (Some(s), Some(a)) = (sock, addr) {
+        let utt = buf.join(" ");
+        let _ = s.send_to(utt.as_bytes(), a);
+        eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
+    }
+    buf.clear();
+}
+
 /// Messages from the stream workers to the matcher. Words carry their abs time
 /// (RTP-timestamp based). Progress = "this pipeline has DECODED up to abs T",
 /// sent every step so the matcher knows the reference's true progress even
@@ -233,6 +246,7 @@ enum Msg {
     Ref(String, f32),
     Mic(String, f32),
     RefProgress(f32),
+    MicProgress(f32),
 }
 
 /// One stream worker: blocking UDP recv → pipeline (silence-padded) → words → tx.
@@ -322,12 +336,12 @@ fn run_stream(
                     return Ok(());
                 }
             }
-            // Heartbeat: how far the REFERENCE pipeline has decoded (on the same
-            // RTP-timestamp axis as the words), so the matcher knows its progress
-            // without waiting on emitted words.
-            if !is_mic {
-                let _ = tx.send(Msg::RefProgress(frame_to_abs(decoded)));
-            }
+            // Heartbeat: how far this pipeline has decoded (on the same RTP-
+            // timestamp axis as the words), so the matcher knows progress without
+            // waiting on emitted words — drives both echo-match readiness (ref)
+            // and the utterance-flush idle gap (mic).
+            let prog = frame_to_abs(decoded);
+            let _ = tx.send(if is_mic { Msg::MicProgress(prog) } else { Msg::RefProgress(prog) });
         }
     }
     Ok(())
@@ -378,9 +392,13 @@ fn main() -> Result<()> {
     let mut last_ref_progress = Instant::now();
     let hold = Duration::from_millis(args.hold_ms);
     // USER-word grouping for the agent feed: accumulate, flush as one utterance
-    // on an idle gap so the agent gets whole sentences, not per-word fragments.
+    // on an AUDIO-time gap (the mic decoded flush_ms past the last USER word, or
+    // a new word jumps >flush_ms ahead) so the agent gets whole sentences.
+    // Audio-time (RTP ts) not wall-clock, because the pipeline emits in bursts.
     let mut user_buf: Vec<String> = Vec::new();
-    let mut last_user = Instant::now();
+    let mut last_user_abs: f32 = 0.0;
+    let mut mic_processed_ms: f32 = 0.0;
+    let flush_gap = args.flush_ms as f32;
 
     loop {
         match rx.recv_timeout(Duration::from_millis(40)) {
@@ -392,6 +410,7 @@ fn main() -> Result<()> {
                 ref_processed_ms = ref_processed_ms.max(abs);
                 last_ref_progress = Instant::now();
             }
+            Ok(Msg::MicProgress(abs)) => mic_processed_ms = mic_processed_ms.max(abs),
             Ok(Msg::Mic(w, abs)) => {
                 // Stage 1 — raw ASR, printed the instant the word appears.
                 println!("{GREEN}[mic ]{RST} {:>7.1}s  {w}", abs / 1000.0);
@@ -436,20 +455,21 @@ fn main() -> Result<()> {
                         let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
                     }
                 } else {
+                    // Word-gap split: a USER word whose audio time jumps >flush_ms
+                    // past the last one starts a new utterance — flush first.
+                    if !user_buf.is_empty() && t - last_user_abs > flush_gap {
+                        flush_user(&mut user_buf, &out_sock, &args.text_out);
+                    }
                     user_buf.push(w.clone());
-                    last_user = Instant::now();
+                    last_user_abs = t;
                 }
             }
         }
 
-        // Flush the grouped USER utterance to the agent after an idle gap.
-        if !user_buf.is_empty() && now.duration_since(last_user).as_millis() as u64 >= args.flush_ms {
-            if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
-                let utt = user_buf.join(" ");
-                let _ = sock.send_to(utt.as_bytes(), addr);
-                eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
-            }
-            user_buf.clear();
+        // Idle flush: the mic has decoded flush_ms past the last USER word with
+        // nothing new (the user stopped) — send the grouped utterance.
+        if !user_buf.is_empty() && mic_processed_ms - last_user_abs >= flush_gap {
+            flush_user(&mut user_buf, &out_sock, &args.text_out);
         }
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
