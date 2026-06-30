@@ -33,6 +33,9 @@ pub struct StreamingPipeline {
     cache: EncoderCache,
     decoder: GreedyDecoder,
     pub all_tokens: Vec<u32>,
+    /// Encoder-frame index for each token in `all_tokens` (parallel). `frame ×
+    /// 80 ms` = token start time. Populated by the timed decode path.
+    pub all_frames: Vec<usize>,
     /// Maximum number of `chunk_size` blocks to run through the conformer
     /// encoder in a single batched pass. 1 = original per-chunk behaviour
     /// (lowest latency). Larger values amortise per-op dispatch overhead —
@@ -80,6 +83,7 @@ impl StreamingPipeline {
             cache,
             decoder,
             all_tokens: Vec::new(),
+            all_frames: Vec::new(),
             max_chunk_batch: 1,
         })
     }
@@ -194,8 +198,13 @@ impl StreamingPipeline {
 
         let enc_seq = enc_out.squeeze(0)?;
         let prev = self.all_tokens.len();
-        self.decoder
-            .decode(&enc_seq, &self.predict, &self.joint, &mut self.all_tokens)?;
+        self.decoder.decode_timed(
+            &enc_seq,
+            &self.predict,
+            &self.joint,
+            &mut self.all_tokens,
+            &mut self.all_frames,
+        )?;
         let new_tokens = self.all_tokens[prev..].to_vec();
         self.encoded_so_far += len;
         Ok(new_tokens)
