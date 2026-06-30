@@ -69,6 +69,14 @@ struct Args {
     delay_lo_ms: i64,
     #[arg(long, default_value_t = 1100)]
     delay_hi_ms: i64,
+    /// Adapt the echo-delay match window: once this many ECHO matches are seen,
+    /// switch from [delay_lo, delay_hi] to [avg − delay_half, avg + delay_half]
+    /// around the running-average observed delay. 0 = fixed window.
+    #[arg(long, default_value_t = 8)]
+    delay_adapt_after: u32,
+    /// Half-width (ms) of the adapted window around the average echo delay.
+    #[arg(long, default_value_t = 500)]
+    delay_half_ms: i64,
     #[arg(long, default_value_t = 0.55)]
     fuzzy_thr: f32,
     /// Max ms a mic word waits for the reference before committing its tag.
@@ -401,6 +409,10 @@ fn main() -> Result<()> {
     let mut ref_processed_ms: f32 = 0.0;
     let mut last_ref_progress = Instant::now();
     let hold = Duration::from_millis(args.hold_ms);
+    // Running-average observed echo delay (dt of confident ECHO matches); once
+    // warmed up, the match window narrows to avg ± delay_half (auto-tuned).
+    let mut delay_ema: f32 = 0.0;
+    let mut delay_n: u32 = 0;
     // USER-word grouping for the agent feed: accumulate, flush as one utterance
     // on an AUDIO-time gap (the mic decoded flush_ms past the last USER word, or
     // a new word jumps >flush_ms ahead) so the agent gets whole sentences.
@@ -442,17 +454,40 @@ fn main() -> Result<()> {
                 break;
             }
             pending_mic.pop_front();
+            // Match window: the fixed [lo, hi] until warmed up, then the learned
+            // average echo delay ± delay_half.
+            let (wlo, whi) = if args.delay_adapt_after > 0 && delay_n >= args.delay_adapt_after {
+                ((delay_ema - args.delay_half_ms as f32).max(0.0), delay_ema + args.delay_half_ms as f32)
+            } else {
+                (args.delay_lo_ms as f32, args.delay_hi_ms as f32)
+            };
             let mut best = ("".to_string(), 0.0f32);
+            let mut best_dt = 0.0f32;
             for (rw, rt) in ref_recent.iter() {
                 let dt = t - rt;
-                if dt >= args.delay_lo_ms as f32 && dt <= args.delay_hi_ms as f32 {
+                if dt >= wlo && dt <= whi {
                     let s = fuzzy(&w, rw);
                     if s > best.1 {
                         best = (rw.clone(), s);
+                        best_dt = dt;
                     }
                 }
             }
             let is_echo = best.1 >= args.fuzzy_thr;
+            if is_echo {
+                // Learn the echo delay from this match (running average).
+                delay_n += 1;
+                delay_ema = if delay_n == 1 { best_dt } else { 0.9 * delay_ema + 0.1 * best_dt };
+                if delay_n == args.delay_adapt_after || (delay_n > args.delay_adapt_after && delay_n % 25 == 0) {
+                    eprintln!(
+                        "{DIM}~~ echo delay avg {:.0}ms -> window [{:.0},{:.0}]ms (n={}){RST}",
+                        delay_ema,
+                        (delay_ema - args.delay_half_ms as f32).max(0.0),
+                        delay_ema + args.delay_half_ms as f32,
+                        delay_n
+                    );
+                }
+            }
             let (col, tag) = if is_echo { (RED, "ECHO") } else { (GREEN, "USER") };
             // Stage 2 — the dedup verdict (may lag the raw print above).
             println!(
