@@ -74,6 +74,11 @@ struct Args {
     /// Max ms a mic word waits for the reference before committing its tag.
     #[arg(long, default_value_t = 1500)]
     hold_ms: u64,
+    /// Group USER words and send them to --text-out as one utterance after this
+    /// many ms with no new USER word (so the agent gets whole sentences, not
+    /// per-word fragments). 0 = send each word immediately.
+    #[arg(long, default_value_t = 700)]
+    flush_ms: u64,
 }
 
 fn pick_device(cpu: bool) -> Device {
@@ -372,6 +377,10 @@ fn main() -> Result<()> {
     let mut ref_processed_ms: f32 = 0.0;
     let mut last_ref_progress = Instant::now();
     let hold = Duration::from_millis(args.hold_ms);
+    // USER-word grouping for the agent feed: accumulate, flush as one utterance
+    // on an idle gap so the agent gets whole sentences, not per-word fragments.
+    let mut user_buf: Vec<String> = Vec::new();
+    let mut last_user = Instant::now();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(40)) {
@@ -421,11 +430,26 @@ fn main() -> Result<()> {
                 "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
                 t / 1000.0, best.0, best.1
             );
-            if !is_echo {
-                if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
-                    let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
+            if !is_echo && args.text_out.is_some() {
+                if args.flush_ms == 0 {
+                    if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
+                        let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
+                    }
+                } else {
+                    user_buf.push(w.clone());
+                    last_user = Instant::now();
                 }
             }
+        }
+
+        // Flush the grouped USER utterance to the agent after an idle gap.
+        if !user_buf.is_empty() && now.duration_since(last_user).as_millis() as u64 >= args.flush_ms {
+            if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
+                let utt = user_buf.join(" ");
+                let _ = sock.send_to(utt.as_bytes(), addr);
+                eprintln!("{GREEN}{BOLD}-> agent:{RST} {utt}");
+            }
+            user_buf.clear();
         }
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
