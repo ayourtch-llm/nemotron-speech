@@ -79,6 +79,11 @@ struct Args {
     /// per-word fragments). 0 = send each word immediately.
     #[arg(long, default_value_t = 700)]
     flush_ms: u64,
+    /// Drop a completed USER utterance with fewer than this many words (a lone
+    /// word is almost always echo/noise that would trigger a spurious agent
+    /// turn). The drop is logged. 1 = send everything.
+    #[arg(long, default_value_t = 2)]
+    min_words: usize,
 }
 
 fn pick_device(cpu: bool) -> Device {
@@ -225,9 +230,14 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     shared as f32 / a.len().max(b.len()) as f32
 }
 
-/// Send the grouped USER utterance to the agent and clear the buffer.
-fn flush_user(buf: &mut Vec<String>, sock: &Option<UdpSocket>, addr: &Option<String>) {
+/// Send the grouped USER utterance to the agent, or drop it if too short.
+fn flush_user(buf: &mut Vec<String>, min_words: usize, sock: &Option<UdpSocket>, addr: &Option<String>) {
     if buf.is_empty() {
+        return;
+    }
+    if buf.len() < min_words {
+        eprintln!("{DIM}-- dropped short utterance: '{}'{RST}", buf.join(" "));
+        buf.clear();
         return;
     }
     if let (Some(s), Some(a)) = (sock, addr) {
@@ -461,7 +471,7 @@ fn main() -> Result<()> {
                     // Word-gap split: a USER word whose audio time jumps >flush_ms
                     // past the last one starts a new utterance — flush first.
                     if !user_buf.is_empty() && t - last_user_abs > flush_gap {
-                        flush_user(&mut user_buf, &out_sock, &args.text_out);
+                        flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out);
                     }
                     user_buf.push(w.clone());
                     last_user_abs = t;
@@ -472,7 +482,7 @@ fn main() -> Result<()> {
         // Idle flush: the mic has decoded flush_ms past the last USER word with
         // nothing new (the user stopped) — send the grouped utterance.
         if !user_buf.is_empty() && mic_processed_ms - last_user_abs >= flush_gap {
-            flush_user(&mut user_buf, &out_sock, &args.text_out);
+            flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out);
         }
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
