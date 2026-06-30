@@ -1144,4 +1144,32 @@ impl FastConformerEncoder {
         }
         Ok(x)
     }
+
+    /// Run the encoder and return the activations AFTER every ConformerLayer
+    /// (index 0..n_layers-1), each `(B, T, d_model)`. For layer-wise probing:
+    /// ASR encoders are speaker-invariant at the TOP but lower/middle layers
+    /// often retain speaker identity — this lets us measure where.
+    pub fn forward_layers(&self, mel: &Tensor, with_chunked_mask: bool) -> Result<Vec<Tensor>> {
+        let x = self.subsample.forward(mel)?;
+        let (_b, t_out, _d) = x.dims3()?;
+        let pos = rel_position_emb(t_out, self.cfg.d_model, x.device(), x.dtype())?;
+        let mask = if with_chunked_mask {
+            Some(chunked_limited_mask(
+                t_out,
+                self.cfg.chunk_size_enc_frames(),
+                self.cfg.left_chunks(),
+                x.device(),
+                x.dtype(),
+            )?)
+        } else {
+            None
+        };
+        let mut x = x;
+        let mut outs = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            x = layer.forward(&x, &pos, mask.as_ref())?;
+            outs.push(x.clone());
+        }
+        Ok(outs)
+    }
 }
