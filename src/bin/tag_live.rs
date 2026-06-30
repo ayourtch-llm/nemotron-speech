@@ -23,7 +23,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{ToSocketAddrs, UdpSocket};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,37 @@ struct Args {
     /// analysis without screen-scraping. Truncated at start.
     #[arg(long)]
     log_file: Option<std::path::PathBuf>,
+    /// Device HTTP control endpoint (host or host:port, e.g. 192.168.0.183).
+    /// When set, the ASR manages the mic idle timeout: it closes the mic
+    /// (`asrstream 0`) after --idle-secs with no transcribed word on EITHER the
+    /// mic or the reference. The wake word re-opens it device-side.
+    #[arg(long)]
+    device_ctl: Option<String>,
+    /// Idle timeout (seconds) for the mic, counted from the last word on either
+    /// stream. Only used with --device-ctl.
+    #[arg(long, default_value_t = 30)]
+    idle_secs: u64,
+}
+
+/// Fire a device CDC command over its HTTP `/cmd` endpoint (blocking, best
+/// effort). `base` is host or host:port (default port 80).
+fn device_cmd(base: &str, cmd: &str) {
+    let (host, port) = match base.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+        _ => (base.to_string(), 80u16),
+    };
+    let enc: String = cmd
+        .chars()
+        .map(|c| if c == ' ' { "%20".to_string() } else { c.to_string() })
+        .collect();
+    let addr = match (host.as_str(), port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        Some(a) => a,
+        None => return,
+    };
+    if let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+        let req = format!("GET /cmd?c={enc} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        let _ = s.write_all(req.as_bytes());
+    }
 }
 
 /// Write a plain transcript line (no ANSI) to the log file if one is open.
@@ -484,12 +515,18 @@ fn main() -> Result<()> {
     let mut last_user_abs: f32 = 0.0;
     let mut mic_processed_ms: f32 = 0.0;
     let flush_gap = args.flush_ms as f32;
+    // Mic idle management (when --device-ctl is set): close the device mic after
+    // idle_secs with no transcribed word on either stream; wake re-opens it.
+    let mut last_activity = Instant::now();
+    let mut mic_armed = true;
+    let idle = Duration::from_secs(args.idle_secs);
 
     loop {
         match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(Msg::Ref(w, abs)) => {
                 println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
                 logln(&mut log_file, &format!("REF\t{:.0}\t{w}", abs));
+                last_activity = Instant::now(); // a reference word = active turn
                 ref_recent.push_back((w, abs));
             }
             Ok(Msg::RefProgress(abs)) => {
@@ -501,6 +538,8 @@ fn main() -> Result<()> {
                 // Stage 1 — raw ASR, printed the instant the word appears.
                 println!("{GREEN}[mic ]{RST} {:>7.1}s  {w}", abs / 1000.0);
                 logln(&mut log_file, &format!("MIC\t{:.0}\t{w}", abs));
+                last_activity = Instant::now();
+                mic_armed = true; // a mic word means the device mic is streaming
                 pending_mic.push_back((w, abs, Instant::now()));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -602,6 +641,16 @@ fn main() -> Result<()> {
         // nothing new (the user stopped) — send the grouped utterance.
         if !user_buf.is_empty() && mic_processed_ms - last_user_abs >= flush_gap {
             flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out, &mut log_file);
+        }
+
+        // Mic idle: no word on either stream for idle_secs — close the device mic.
+        if let Some(ctl) = &args.device_ctl {
+            if mic_armed && now.duration_since(last_activity) >= idle {
+                eprintln!("{DIM}-- mic idle {}s -> closing device mic{RST}", args.idle_secs);
+                logln(&mut log_file, &format!("IDLE\tasrstream 0 ({}s)", args.idle_secs));
+                device_cmd(ctl, "asrstream 0");
+                mic_armed = false;
+            }
         }
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
