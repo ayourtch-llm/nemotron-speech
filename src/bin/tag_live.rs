@@ -174,6 +174,26 @@ impl WordGrouper {
         }
         words
     }
+
+    /// Emit the trailing in-progress word (which `push` holds until the next word
+    /// starts) once the pipeline has decoded `gap_frames` past it with no new
+    /// word — i.e. end of utterance. Without this the last word of every phrase
+    /// hangs until the next phrase arrives.
+    fn flush_stale(&mut self, decoded_frame: usize, gap_frames: usize) -> Option<(String, usize)> {
+        let last = *self.buf_frames.last()?;
+        if decoded_frame <= last + gap_frames {
+            return None;
+        }
+        let w = self.tok.detokenize(&self.buf_tokens).unwrap_or_default().trim().to_string();
+        let start = self.buf_frames[0];
+        self.buf_tokens.clear();
+        self.buf_frames.clear();
+        if w.is_empty() {
+            None
+        } else {
+            Some((w, start))
+        }
+    }
 }
 
 fn norm(w: &str) -> String {
@@ -287,11 +307,21 @@ fn run_stream(
                 }
             }
         }
-        // Heartbeat: how far the REFERENCE pipeline has decoded (latest frame's
-        // abs), so the matcher knows its progress without waiting on emitted words.
-        if advanced && !is_mic {
-            if let Some(&last_frame) = pipe.all_frames.last() {
-                let _ = tx.send(Msg::RefProgress(frame_to_abs(last_frame)));
+        if advanced {
+            let decoded = pipe.decoded_frames();
+            // Flush a trailing word once decoding has moved ~0.5s past it.
+            if let Some((w, frame)) = grouper.flush_stale(decoded, 6) {
+                let abs_ms = frame_to_abs(frame);
+                let msg = if is_mic { Msg::Mic(w, abs_ms) } else { Msg::Ref(w, abs_ms) };
+                if tx.send(msg).is_err() {
+                    return Ok(());
+                }
+            }
+            // Heartbeat: how far the REFERENCE pipeline has decoded (on the same
+            // RTP-timestamp axis as the words), so the matcher knows its progress
+            // without waiting on emitted words.
+            if !is_mic {
+                let _ = tx.send(Msg::RefProgress(frame_to_abs(decoded)));
             }
         }
     }
@@ -353,7 +383,11 @@ fn main() -> Result<()> {
                 ref_processed_ms = ref_processed_ms.max(abs);
                 last_ref_progress = Instant::now();
             }
-            Ok(Msg::Mic(w, abs)) => pending_mic.push_back((w, abs, Instant::now())),
+            Ok(Msg::Mic(w, abs)) => {
+                // Stage 1 — raw ASR, printed the instant the word appears.
+                println!("{GREEN}[mic ]{RST} {:>7.1}s  {w}", abs / 1000.0);
+                pending_mic.push_back((w, abs, Instant::now()));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -382,8 +416,9 @@ fn main() -> Result<()> {
             }
             let is_echo = best.1 >= args.fuzzy_thr;
             let (col, tag) = if is_echo { (RED, "ECHO") } else { (GREEN, "USER") };
+            // Stage 2 — the dedup verdict (may lag the raw print above).
             println!(
-                "{col}{BOLD}[mic ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
+                "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
                 t / 1000.0, best.0, best.1
             );
             if !is_echo {

@@ -94,6 +94,14 @@ impl StreamingPipeline {
         self.max_chunk_batch = n.max(1);
     }
 
+    /// Total encoder frames decoded so far (the decode cursor). Advances through
+    /// silence (blank tokens) too, unlike `all_frames` which only records emitted
+    /// tokens — so it tells how far past a word the pipeline has progressed
+    /// (used to flush a trailing in-progress word at end of utterance).
+    pub fn decoded_frames(&self) -> usize {
+        self.decoder.base_frame
+    }
+
     /// Append more audio. Pre-emphasis + STFT framing run as samples arrive;
     /// no encoder work happens until `try_advance()` is called.
     pub fn push_audio(&mut self, samples: &[f32]) {
