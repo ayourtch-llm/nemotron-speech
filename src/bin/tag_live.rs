@@ -77,6 +77,12 @@ struct Args {
     /// Half-width (ms) of the adapted window around the average echo delay.
     #[arg(long, default_value_t = 500)]
     delay_half_ms: i64,
+    /// Lax pass: within ±this many ms of the LEARNED echo delay (a tight,
+    /// precise window), also tag ECHO when the mic word merely matches a
+    /// reference word PHONETICALLY — catches misrecognized echo (capa≈kappa).
+    /// 0 = disabled. Only active once the delay is learned.
+    #[arg(long, default_value_t = 250)]
+    lax_half_ms: i64,
     #[arg(long, default_value_t = 0.55)]
     fuzzy_thr: f32,
     /// Max ms a mic word waits for the reference before committing its tag.
@@ -236,6 +242,34 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     let n = a.len().min(b.len());
     let shared = (0..n).filter(|&i| a.as_bytes()[i] == b.as_bytes()[i]).count();
     shared as f32 / a.len().max(b.len()) as f32
+}
+
+/// Phonetic consonant skeleton — folds common sound-alikes and drops vowels, so
+/// misrecognized echo (capa/kappa, omacron/omicron, pyro/piro, yoda/iota) maps
+/// to the same key. Used only for the tight-timing lax pass.
+fn phonetic(w: &str) -> String {
+    let mut out = String::new();
+    let mut last = '\0';
+    for c in w.to_lowercase().chars() {
+        let f = match c {
+            'c' | 'k' | 'q' => 'k',
+            's' | 'z' => 's',
+            'f' | 'v' => 'f',
+            'd' | 't' => 't',
+            'b' | 'p' => 'p',
+            'g' | 'j' => 'j',
+            'm' | 'n' => 'n',
+            'l' | 'r' => 'r',
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'h' | 'w' => continue, // vowels/weak
+            other if other.is_ascii_alphabetic() => other,
+            _ => continue,
+        };
+        if f != last {
+            out.push(f);
+            last = f;
+        }
+    }
+    out
 }
 
 /// Send the grouped USER utterance to the agent, or drop it if too short.
@@ -473,7 +507,28 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let is_echo = best.1 >= args.fuzzy_thr;
+            let mut is_echo = best.1 >= args.fuzzy_thr;
+            // Lax pass: if the strict content match failed but a reference word
+            // sits within ±lax_half of the LEARNED delay and matches phonetically,
+            // it's misrecognized echo (the tight timing corroborates it).
+            if !is_echo
+                && args.lax_half_ms > 0
+                && args.delay_adapt_after > 0
+                && delay_n >= args.delay_adapt_after
+            {
+                let pw = phonetic(&w);
+                if pw.len() >= 2 {
+                    for (rw, rt) in ref_recent.iter() {
+                        let dt = t - rt;
+                        if (dt - delay_ema).abs() <= args.lax_half_ms as f32 && phonetic(rw) == pw {
+                            is_echo = true;
+                            best = (format!("{rw}~"), 0.5);
+                            best_dt = dt;
+                            break;
+                        }
+                    }
+                }
+            }
             if is_echo {
                 // Learn the echo delay from this match (running average).
                 delay_n += 1;
