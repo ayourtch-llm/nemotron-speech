@@ -200,10 +200,14 @@ fn fuzzy(a: &str, b: &str) -> f32 {
     shared as f32 / a.len().max(b.len()) as f32
 }
 
-/// A word emitted by a stream worker, on the common (offset + frame-time) axis.
+/// Messages from the stream workers to the matcher. Words carry their abs time
+/// (RTP-timestamp based). Progress = "this pipeline has DECODED up to abs T",
+/// sent every step so the matcher knows the reference's true progress even
+/// across silence (decoupled from word emission, which lags + bursts).
 enum Msg {
     Ref(String, f32),
     Mic(String, f32),
+    RefProgress(f32),
 }
 
 /// One stream worker: blocking UDP recv → pipeline (silence-padded) → words → tx.
@@ -256,27 +260,38 @@ fn run_stream(
         }
         pipe.push_audio(&samples);
         pushed += samples.len();
+        // frame → abs ms via the nearest anchor at-or-before its pushed-sample.
+        let frame_to_abs = |frame: usize| -> f32 {
+            let sample = frame * SAMPLES_PER_FRAME;
+            let ts_at = anchors
+                .iter()
+                .rev()
+                .find(|(p, _)| *p <= sample)
+                .map(|(p, t)| t.wrapping_add((sample - p) as u32))
+                .unwrap_or(ts);
+            ts_at as f32 / 16.0 // 16 samples / ms @ 16 kHz
+        };
+        let mut advanced = false;
         while let Some(toks) = pipe.try_advance()? {
+            advanced = true;
             if toks.is_empty() {
                 continue;
             }
             let prev = pipe.all_tokens.len() - toks.len();
             let frames = pipe.all_frames[prev..].to_vec();
             for (w, frame) in grouper.push(&toks, &frames) {
-                // frame → cumulative pushed-sample position (80 ms = 1280 samp).
-                let sample = frame * SAMPLES_PER_FRAME;
-                // Nearest anchor at-or-before this sample → RTP ts of that audio.
-                let ts_at = anchors
-                    .iter()
-                    .rev()
-                    .find(|(p, _)| *p <= sample)
-                    .map(|(p, t)| t.wrapping_add((sample - p) as u32))
-                    .unwrap_or(ts);
-                let abs_ms = ts_at as f32 / 16.0; // 16 samples / ms @ 16 kHz
+                let abs_ms = frame_to_abs(frame);
                 let msg = if is_mic { Msg::Mic(w, abs_ms) } else { Msg::Ref(w, abs_ms) };
                 if tx.send(msg).is_err() {
                     return Ok(());
                 }
+            }
+        }
+        // Heartbeat: how far the REFERENCE pipeline has decoded (latest frame's
+        // abs), so the matcher knows its progress without waiting on emitted words.
+        if advanced && !is_mic {
+            if let Some(&last_frame) = pipe.all_frames.last() {
+                let _ = tx.send(Msg::RefProgress(frame_to_abs(last_frame)));
             }
         }
     }
@@ -321,17 +336,22 @@ fn main() -> Result<()> {
 
     let mut ref_recent: VecDeque<(String, f32)> = VecDeque::new();
     let mut pending_mic: VecDeque<(String, f32, Instant)> = VecDeque::new();
-    let mut ref_latest_ms: f32 = 0.0;
-    let mut last_ref_word = Instant::now();
+    // How far the reference pipeline has DECODED (heartbeat), and when that last
+    // advanced — drives both "is the reference caught up to this mic word" and
+    // "is TTS active" without depending on word emission timing.
+    let mut ref_processed_ms: f32 = 0.0;
+    let mut last_ref_progress = Instant::now();
     let hold = Duration::from_millis(args.hold_ms);
 
     loop {
         match rx.recv_timeout(Duration::from_millis(40)) {
             Ok(Msg::Ref(w, abs)) => {
                 println!("{DIM}{RED}[ref ]{RST}{RED} {:>7.1}s  {w}{RST}", abs / 1000.0);
-                ref_latest_ms = ref_latest_ms.max(abs);
-                last_ref_word = Instant::now();
                 ref_recent.push_back((w, abs));
+            }
+            Ok(Msg::RefProgress(abs)) => {
+                ref_processed_ms = ref_processed_ms.max(abs);
+                last_ref_progress = Instant::now();
             }
             Ok(Msg::Mic(w, abs)) => pending_mic.push_back((w, abs, Instant::now())),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -339,9 +359,12 @@ fn main() -> Result<()> {
         }
 
         let now = Instant::now();
-        let tts_active = now.duration_since(last_ref_word).as_millis() < 600;
+        let tts_active = now.duration_since(last_ref_progress).as_millis() < 600;
         while let Some((w, t, arrived)) = pending_mic.front().cloned() {
-            let ref_caught_up = ref_latest_ms >= t - args.delay_lo_ms as f32;
+            // Commit once the reference pipeline has DECODED past this word's
+            // echo-source time (so ref_recent holds the matching word), or TTS is
+            // silent, or we time out.
+            let ref_caught_up = ref_processed_ms >= t - args.delay_lo_ms as f32;
             let timed_out = now.duration_since(arrived) >= hold;
             if !(ref_caught_up || !tts_active || timed_out) {
                 break;
@@ -372,7 +395,7 @@ fn main() -> Result<()> {
 
         let horizon = (args.delay_hi_ms + 4000) as f32;
         while let Some((_, rt)) = ref_recent.front() {
-            if ref_latest_ms - rt > horizon {
+            if ref_processed_ms - rt > horizon {
                 ref_recent.pop_front();
             } else {
                 break;
