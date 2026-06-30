@@ -219,6 +219,26 @@ fn run_stream(
 ) -> Result<()> {
     let _ = prog_start;
     let sock = UdpSocket::bind(&listen).with_context(|| format!("binding {listen}"))?;
+    // DEDICATED RECV THREAD: just recv + parse, never blocked by the ASR. Pushes
+    // into an unbounded channel so no UDP packets are dropped while the pipeline
+    // grinds (the cause of tag_live missing words the agent sees), and it also
+    // buffers cleanly through model load.
+    let (atx, arx) = mpsc::channel::<(Vec<f32>, u32)>();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            match sock.recv(&mut buf) {
+                Ok(n) => {
+                    if let Some(p) = parse_l16(&buf[..n]) {
+                        if atx.send(p).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
     let mut pipe = build_pipeline(&st, &device, DType::F32, batch)?;
     let mut grouper = WordGrouper::new(Tokenizer::from_file(&tok)?);
     // Anchors map this pipeline's cumulative pushed-sample position to the RTP
@@ -226,13 +246,7 @@ fn run_stream(
     // RTP timestamp (in ms). Gap-accurate and immune to processing lag.
     let mut anchors: VecDeque<(usize, u32)> = VecDeque::new();
     let mut pushed: usize = 0;
-    let mut buf = vec![0u8; 65_536];
-    loop {
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let Some((samples, ts)) = parse_l16(&buf[..n]) else { continue };
+    while let Ok((samples, ts)) = arx.recv() {
         if samples.is_empty() {
             continue;
         }
@@ -266,6 +280,7 @@ fn run_stream(
             }
         }
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
