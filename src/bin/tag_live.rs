@@ -449,7 +449,10 @@ fn main() -> Result<()> {
                 "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
                 t / 1000.0, best.0, best.1
             );
-            if !is_echo && args.text_out.is_some() {
+            // Only forward real words to the agent — skip standalone punctuation
+            // tokens (".", "?", …) the ASR emits, which otherwise become junk
+            // one-token utterances that trigger spurious turns.
+            if !is_echo && args.text_out.is_some() && !norm(&w).is_empty() {
                 if args.flush_ms == 0 {
                     if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
                         let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
