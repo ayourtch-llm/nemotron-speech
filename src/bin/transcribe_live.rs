@@ -132,6 +132,130 @@ struct Args {
     /// transcripts you'll scrub through later. Does not affect `--text-out`.
     #[arg(long, default_value_t = false)]
     timestamps: bool,
+    /// Also save the captured audio to this file (session archive, e.g. to
+    /// re-transcribe later with a bigger model). Format is chosen by extension:
+    /// `.wav` (always available) or `.mp3` (needs a build with `--features
+    /// mp3`). Intended for PUBLIC sessions only.
+    #[arg(long)]
+    save_audio: Option<PathBuf>,
+}
+
+/// Optional session-audio archiver. Accepts the raw 16 kHz mono f32 mic samples
+/// and writes them as WAV (always) or MP3 (feature `mp3`). Intended for public
+/// sessions the recorder is entitled to capture.
+enum AudioSaver {
+    Wav {
+        writer: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
+        path: PathBuf,
+    },
+    #[cfg(feature = "mp3")]
+    Mp3 {
+        enc: mp3lame_encoder::Encoder,
+        file: std::io::BufWriter<std::fs::File>,
+        path: PathBuf,
+    },
+}
+
+impl AudioSaver {
+    fn open(path: &std::path::Path) -> Result<Self> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "wav" => {
+                let spec = hound::WavSpec {
+                    channels: 1,
+                    sample_rate: SR_HZ as u32,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                };
+                let writer = hound::WavWriter::create(path, spec)
+                    .with_context(|| format!("creating WAV {}", path.display()))?;
+                Ok(AudioSaver::Wav { writer, path: path.to_path_buf() })
+            }
+            #[cfg(feature = "mp3")]
+            "mp3" => {
+                use mp3lame_encoder::{Bitrate, Builder, Quality};
+                let mut b = Builder::new().context("LAME builder alloc")?;
+                b.set_num_channels(1)
+                    .map_err(|e| anyhow::anyhow!("mp3 channels: {e:?}"))?;
+                b.set_sample_rate(SR_HZ as u32)
+                    .map_err(|e| anyhow::anyhow!("mp3 sample rate: {e:?}"))?;
+                b.set_brate(Bitrate::Kbps64)
+                    .map_err(|e| anyhow::anyhow!("mp3 bitrate: {e:?}"))?;
+                b.set_quality(Quality::Good)
+                    .map_err(|e| anyhow::anyhow!("mp3 quality: {e:?}"))?;
+                let enc = b.build().map_err(|e| anyhow::anyhow!("LAME init: {e:?}"))?;
+                let file = std::io::BufWriter::new(
+                    std::fs::File::create(path)
+                        .with_context(|| format!("creating MP3 {}", path.display()))?,
+                );
+                Ok(AudioSaver::Mp3 { enc, file, path: path.to_path_buf() })
+            }
+            #[cfg(not(feature = "mp3"))]
+            "mp3" => anyhow::bail!(
+                "MP3 output needs a build with `--features mp3` (this binary lacks it); \
+                 use a .wav path instead"
+            ),
+            other => anyhow::bail!("unsupported --save-audio extension {:?} (use .wav or .mp3)", other),
+        }
+    }
+
+    /// Append a chunk of raw f32 [-1,1] mono samples.
+    fn push(&mut self, samples: &[f32]) -> Result<()> {
+        match self {
+            AudioSaver::Wav { writer, .. } => {
+                for &s in samples {
+                    let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    writer.write_sample(v)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "mp3")]
+            AudioSaver::Mp3 { enc, file, .. } => {
+                use std::io::Write as _;
+                let pcm: Vec<i16> = samples
+                    .iter()
+                    .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .collect();
+                let mut out = Vec::new();
+                out.reserve(mp3lame_encoder::max_required_buffer_size(pcm.len()));
+                let n = enc
+                    .encode(mp3lame_encoder::MonoPcm(&pcm), out.spare_capacity_mut())
+                    .map_err(|e| anyhow::anyhow!("mp3 encode: {e:?}"))?;
+                // SAFETY: encoder wrote `n` initialised bytes into the spare capacity.
+                unsafe { out.set_len(n) };
+                file.write_all(&out)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Flush and close, returning the written path for logging.
+    fn finalize(self) -> Result<PathBuf> {
+        match self {
+            AudioSaver::Wav { writer, path } => {
+                writer.finalize().context("finalizing WAV")?;
+                Ok(path)
+            }
+            #[cfg(feature = "mp3")]
+            AudioSaver::Mp3 { mut enc, mut file, path } => {
+                use std::io::Write as _;
+                let mut out = Vec::new();
+                out.reserve(mp3lame_encoder::max_required_buffer_size(0) + 7200);
+                let n = enc
+                    .flush::<mp3lame_encoder::FlushNoGap>(out.spare_capacity_mut())
+                    .map_err(|e| anyhow::anyhow!("mp3 flush: {e:?}"))?;
+                // SAFETY: flush wrote `n` initialised bytes into the spare capacity.
+                unsafe { out.set_len(n) };
+                file.write_all(&out)?;
+                file.flush()?;
+                Ok(path)
+            }
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -345,6 +469,15 @@ async fn main() -> Result<()> {
         }
     };
 
+    let mut audio_saver = match &args.save_audio {
+        Some(path) => {
+            let s = AudioSaver::open(path)?;
+            eprintln!("saving audio to {}", path.display());
+            Some(s)
+        }
+        None => None,
+    };
+
     eprintln!("listening... (Ctrl-C to stop)");
     if args.timestamps {
         // Absolute wall-clock anchor for the session; per-chunk lines carry the
@@ -370,8 +503,14 @@ async fn main() -> Result<()> {
     // Total audio samples consumed so far (16 kHz). Drives --timestamps.
     let mut audio_samples: u64 = 0;
 
+    let mut sigint = std::pin::pin!(tokio::signal::ctrl_c());
     loop {
-        match source.next_chunk().await? {
+        let next = tokio::select! {
+            biased;
+            _ = &mut sigint => { eprintln!("\n[interrupt] stopping…"); None }
+            c = source.next_chunk() => c?,
+        };
+        match next {
             None => break,
             Some(chunk) => {
                 let is_final = chunk.is_final;
@@ -390,6 +529,9 @@ async fn main() -> Result<()> {
                 };
                 let samples_for_pipe: &[f32] = cleaned.as_deref().unwrap_or(&chunk.samples);
                 audio_samples += chunk.samples.len() as u64;
+                if let Some(saver) = audio_saver.as_mut() {
+                    saver.push(&chunk.samples)?;
+                }
                 pipe.push_audio(samples_for_pipe);
                 if is_final {
                     pipe.finish();
@@ -503,6 +645,10 @@ async fn main() -> Result<()> {
         }
     }
     eprintln!();
+    if let Some(saver) = audio_saver.take() {
+        let path = saver.finalize()?;
+        eprintln!("[audio] saved {}", path.display());
+    }
     Ok(())
 }
 
