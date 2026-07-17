@@ -126,6 +126,12 @@ struct Args {
     /// of extra latency. Numerically identical regardless of N.
     #[arg(long, default_value_t = 1)]
     chunk_batch: usize,
+    /// Prefix each emitted `[chunk]` line with its audio-relative timestamp
+    /// `[HH:MM:SS]` — elapsed audio time (samples consumed / 16 kHz), so it is
+    /// immune to processing lag and monotonic. Handy for meeting/session
+    /// transcripts you'll scrub through later. Does not affect `--text-out`.
+    #[arg(long, default_value_t = false)]
+    timestamps: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -353,6 +359,8 @@ async fn main() -> Result<()> {
     // With --coalesce-text, accumulate chunks within an utterance here and
     // ship the whole buffer on idle-flush / is_final.
     let mut utterance_buf: String = String::new();
+    // Total audio samples consumed so far (16 kHz). Drives --timestamps.
+    let mut audio_samples: u64 = 0;
 
     loop {
         match source.next_chunk().await? {
@@ -373,6 +381,7 @@ async fn main() -> Result<()> {
                     _ => None,
                 };
                 let samples_for_pipe: &[f32] = cleaned.as_deref().unwrap_or(&chunk.samples);
+                audio_samples += chunk.samples.len() as u64;
                 pipe.push_audio(samples_for_pipe);
                 if is_final {
                     pipe.finish();
@@ -435,7 +444,13 @@ async fn main() -> Result<()> {
                     };
                     let cur = tok.detokenize(&pipe.all_tokens[..upto])?;
                     let new_text = cur.strip_prefix(&prev).unwrap_or(&cur);
-                    eprintln!("[chunk] {}", new_text);
+                    let ts = if args.timestamps {
+                        let secs = audio_samples / SR_HZ as u64;
+                        format!("[{:02}:{:02}:{:02}] ", secs / 3600, (secs % 3600) / 60, secs % 60)
+                    } else {
+                        String::new()
+                    };
+                    eprintln!("[chunk] {}{}", ts, new_text);
                     std::io::stderr().flush().ok();
                     new_chunk_text = new_text.to_string();
                 }
