@@ -346,6 +346,14 @@ async fn main() -> Result<()> {
     };
 
     eprintln!("listening... (Ctrl-C to stop)");
+    if args.timestamps {
+        // Absolute wall-clock anchor for the session; per-chunk lines carry the
+        // machine-local time-of-day alongside the audio-relative offset.
+        eprintln!(
+            "[start] {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
+        );
+    }
     std::io::stderr().flush().ok();
 
     // Index up to which we've already emitted text. We hold back any trailing
@@ -445,8 +453,15 @@ async fn main() -> Result<()> {
                     let cur = tok.detokenize(&pipe.all_tokens[..upto])?;
                     let new_text = cur.strip_prefix(&prev).unwrap_or(&cur);
                     let ts = if args.timestamps {
+                        // wall = machine-local time-of-day at emission (honest
+                        // real time); a<..> = audio-elapsed position (lag-immune).
+                        // If the two drift apart, the pipeline is falling behind.
                         let secs = audio_samples / SR_HZ as u64;
-                        format!("[{:02}:{:02}:{:02}] ", secs / 3600, (secs % 3600) / 60, secs % 60)
+                        let wall = chrono::Local::now().format("%H:%M:%S");
+                        format!(
+                            "[{} | a{:02}:{:02}:{:02}] ",
+                            wall, secs / 3600, (secs % 3600) / 60, secs % 60
+                        )
                     } else {
                         String::new()
                     };
