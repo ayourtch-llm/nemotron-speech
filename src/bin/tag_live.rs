@@ -515,6 +515,77 @@ fn main() -> Result<()> {
     let mut last_user_abs: f32 = 0.0;
     let mut mic_processed_ms: f32 = 0.0;
     let flush_gap = args.flush_ms as f32;
+    // Timing-alignment echo suppression. ECHO words are "anchors"; between two
+    // anchors we buffer the candidate-USER run and, when the closing anchor lands,
+    // align each UNMATCHED ref word in that slot to the buffered mic word nearest
+    // its expected echo time (ref_ts + learned delay ± window) — those are echoes
+    // and get dropped; buffered words that align to NO slot ref word are real
+    // speech (a barge-in like "stop") and get forwarded. Handles N words in a gap:
+    // e.g. "foo [stop bal] baz" — "bal" aligns to ref "bar"'s echo time (drop),
+    // "stop" aligns to nothing (pass).
+    let mut user_run: Vec<(String, f32)> = Vec::new(); // (word, audio_ts) since last anchor
+    let mut left_anchor_rt: Option<f32> = None;        // ref ts of the previous ECHO anchor
+    // Emit a resolved word: the Stage-2 [dup] verdict line + forward to the agent
+    // when USER. Shared by the anchor path and the run flush.
+    macro_rules! emit_resolved {
+        ($w:expr, $t:expr, $echo:expr, $bref:expr, $bscore:expr) => {{
+            let (col, tag) = if $echo { (RED, "ECHO") } else { (GREEN, "USER") };
+            println!(
+                "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
+                $t / 1000.0, $w, $bref, $bscore
+            );
+            logln(&mut log_file, &format!("[dup ] {:>7.1}s  {:<14} {tag} (ref~'{}' {:.2})", $t / 1000.0, $w, $bref, $bscore));
+            if !$echo && args.text_out.is_some() && !norm(&$w).is_empty() {
+                if args.flush_ms == 0 {
+                    if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
+                        let _ = sock.send_to(format!("{} ", $w).as_bytes(), addr);
+                    }
+                } else {
+                    if !user_buf.is_empty() && $t - last_user_abs > flush_gap {
+                        flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out, &mut log_file);
+                    }
+                    user_buf.push($w.clone());
+                    last_user_abs = $t;
+                }
+            }
+        }};
+    }
+    // Resolve the buffered run against the ref-time slot ($left, $right) bounded by
+    // the two surrounding ECHO anchors: timing-align each unmatched slot ref word to
+    // the nearest buffered mic word (echo lands at ref_ts + delay_ema ± window) and
+    // drop those; forward the rest. Only aligns once the delay is warmed up — before
+    // that we can't trust the timing, so the whole run is forwarded as speech.
+    macro_rules! resolve_run {
+        ($left:expr, $right:expr) => {{
+            let (glo, ghi) = ($left.min($right), $left.max($right));
+            let win = args.delay_half_ms as f32;
+            let mut dropped = vec![false; user_run.len()];
+            if args.delay_adapt_after > 0 && delay_n >= args.delay_adapt_after {
+                for (rref, rt) in ref_recent.iter() {
+                    if *rt > glo && *rt < ghi {
+                        // This ref word's echo is expected at rt + delay. Among the
+                        // buffered words within the timing window, the echo is the one
+                        // most CONTENT-similar to rref (it's a mishearing of it) — a
+                        // genuine barge-in like "stop" sits near in time but matches
+                        // rref poorly, so it survives.
+                        let expected = rt + delay_ema;
+                        let mut best_i: Option<usize> = None;
+                        let mut best_score = -1.0f32;
+                        for (i, (uw, ut)) in user_run.iter().enumerate() {
+                            if dropped[i] || (ut - expected).abs() > win { continue; }
+                            let s = fuzzy(uw, rref);
+                            if s > best_score { best_score = s; best_i = Some(i); }
+                        }
+                        if let Some(i) = best_i { dropped[i] = true; }
+                    }
+                }
+            }
+            for (i, (rw, rt2)) in std::mem::take(&mut user_run).into_iter().enumerate() {
+                if dropped[i] { emit_resolved!(rw, rt2, true, "~time".to_string(), 0.0); }
+                else { emit_resolved!(rw, rt2, false, String::new(), 0.0); }
+            }
+        }};
+    }
     // Mic idle management (when --device-ctl is set): close the device mic after
     // idle_secs with no transcribed word on either stream; wake re-opens it.
     let mut last_activity = Instant::now();
@@ -610,29 +681,36 @@ fn main() -> Result<()> {
                     logln(&mut log_file, &format!("~~ echo delay avg {delay_ema:.0}ms -> window [{lo:.0},{hi:.0}]ms (n={delay_n})"));
                 }
             }
-            let (col, tag) = if is_echo { (RED, "ECHO") } else { (GREEN, "USER") };
-            // Stage 2 — the dedup verdict (may lag the raw print above).
-            println!(
-                "{col}{BOLD}[dup ]{RST}{col} {:>7.1}s  {w:<14} {tag}{RST} {DIM}(ref~'{}' {:.2}){RST}",
-                t / 1000.0, best.0, best.1
-            );
-            logln(&mut log_file, &format!("[dup ] {:>7.1}s  {w:<14} {tag} (ref~'{}' {:.2} dt={:.0})", t / 1000.0, best.0, best.1, best_dt));
-            // Only forward real words to the agent — skip standalone punctuation
-            // tokens (".", "?", …) the ASR emits, which otherwise become junk
-            // one-token utterances that trigger spurious turns.
-            if !is_echo && args.text_out.is_some() && !norm(&w).is_empty() {
-                if args.flush_ms == 0 {
-                    if let (Some(sock), Some(addr)) = (&out_sock, &args.text_out) {
-                        let _ = sock.send_to(format!("{w} ").as_bytes(), addr);
-                    }
+            // Stage 2 — the dedup verdict via timing alignment. An ECHO word is an
+            // anchor: resolve the buffered candidate-USER run against the slot
+            // between the previous anchor and this one (drop timing-aligned echoes,
+            // forward the rest), then print the anchor. A non-echo word is buffered
+            // until the next anchor (or the run flush) decides it.
+            if is_echo {
+                let this_rt = t - best_dt;
+                if let Some(left_rt) = left_anchor_rt {
+                    resolve_run!(left_rt, this_rt);
                 } else {
-                    // Word-gap split: a USER word whose audio time jumps >flush_ms
-                    // past the last one starts a new utterance — flush first.
-                    if !user_buf.is_empty() && t - last_user_abs > flush_gap {
-                        flush_user(&mut user_buf, args.min_words, &out_sock, &args.text_out, &mut log_file);
+                    // No left anchor yet — can't bound a slot; the run is all speech.
+                    for (rw, rt2) in std::mem::take(&mut user_run) {
+                        emit_resolved!(rw, rt2, false, String::new(), 0.0);
                     }
-                    user_buf.push(w.clone());
-                    last_user_abs = t;
+                }
+                emit_resolved!(w.clone(), t, true, best.0.clone(), best.1); // the anchor
+                left_anchor_rt = Some(this_rt);
+            } else {
+                user_run.push((w.clone(), t));
+            }
+        }
+
+        // Run flush: the mic settled flush_ms past the buffered run with no closing
+        // anchor (user stopped / TTS ended) — nothing to cancel against, so forward
+        // the whole run as speech. Runs BEFORE the user_buf flush so trailing words
+        // make it into the utterance.
+        if let Some(&(_, last_t)) = user_run.last() {
+            if mic_processed_ms - last_t >= flush_gap {
+                for (rw, rt2) in std::mem::take(&mut user_run) {
+                    emit_resolved!(rw, rt2, false, String::new(), 0.0);
                 }
             }
         }
