@@ -45,6 +45,13 @@ webrtc-aec = [
 version = "0.15"
 optional = true
 
+# udp_mic_send is #![cfg(feature = "mic")]: without this gate a default
+# (no-mic) build hits E0601 "main not found" on the empty module.
+[[bin]]
+name = "udp_mic_send"
+path = "src/bin/udp_mic_send.rs"
+required-features = ["mic"]
+
 [profile.release]
 opt-level = 3
 lto = "thin"
